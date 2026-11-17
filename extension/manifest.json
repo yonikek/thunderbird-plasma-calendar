@@ -1,0 +1,40 @@
+{
+  "manifest_version": 2,
+  "name": "Thunderbird Calendar for KDE Plasma",
+  "description": "Makes Thunderbird calendar events available to the KDE Plasma Digital Clock calendar.",
+  "version": "0.1.0",
+  "author": "Thunderbird Plasma Calendar contributors",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "thunderbird-calendar-bridge@kde.org",
+      "strict_min_version": "128.0"
+    }
+  },
+  "icons": {
+    "48": "icons/calendar.png"
+  },
+  "permissions": [
+    "nativeMessaging"
+  ],
+  "background": {
+    "scripts": [
+      "background.js"
+    ]
+  },
+  "experiment_apis": {
+    "tbCalendarBridge": {
+      "schema": "experiments/schema.json",
+      "parent": {
+        "scopes": [
+          "addon_parent"
+        ],
+        "script": "experiments/implementation.js",
+        "paths": [
+          [
+            "tbCalendarBridge"
+          ]
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,16 @@
+[
+  {
+    "namespace": "tbCalendarBridge",
+    "functions": [
+      {
+        "name": "getSnapshot",
+        "type": "function",
+        "async": true,
+        "parameters": [
+          { "name": "startIso", "type": "string" },
+          { "name": "endIso", "type": "string" }
+        ]
+      }
+    ]
+  }
+]

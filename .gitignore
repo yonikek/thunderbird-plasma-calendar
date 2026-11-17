@@ -1,0 +1,8 @@
+build/
+build-install/
+_install/
+result
+*.xpi
+*.so
+__pycache__/
+*.pyc

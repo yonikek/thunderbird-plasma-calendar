@@ -1,0 +1,9 @@
+{
+  "name": "org.kde.plasma.thunderbird_calendar",
+  "description": "Exports Thunderbird calendar events to KDE Plasma",
+  "path": "@THUNDERBIRD_CALENDAR_HOST_PATH@",
+  "type": "stdio",
+  "allowed_extensions": [
+    "thunderbird-calendar-bridge@kde.org"
+  ]
+}
