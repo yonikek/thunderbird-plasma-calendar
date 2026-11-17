@@ -13,6 +13,13 @@ include(KDECompilerSettings NO_POLICY_SCOPE)
 include(ECMQmlModule)
 
 find_package(Qt6 6.5 REQUIRED COMPONENTS Core DBus Qml)
+
+# The QML module has no extra QML subdirectories, so the stricter qmldir
+# behaviour is safe. The policy only exists in Qt 6.8 and later.
+if(QT_KNOWN_POLICY_QTP0004)
+    qt_policy(SET QTP0004 NEW)
+endif()
+
 find_package(KF6CoreAddons 6.0 CONFIG REQUIRED)
 find_package(KF6Declarative 6.0 CONFIG REQUIRED)
 find_package(KF6Config 6.0 CONFIG REQUIRED)

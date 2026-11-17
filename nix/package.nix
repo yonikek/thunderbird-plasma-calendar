@@ -11,7 +11,9 @@ stdenv.mkDerivation {
   pname = "thunderbird-plasma-calendar";
   version = "0.1.0";
   src = lib.cleanSourceWith {
-    src = ../.;
+    # cleanSource drops .git, result symlinks and editor backups so that
+    # unrelated changes do not alter the derivation.
+    src = lib.cleanSource ../.;
     filter = path: _type:
       !(builtins.elem (baseNameOf (toString path)) [
         "build"

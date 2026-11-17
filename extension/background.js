@@ -3,12 +3,15 @@
 
 const NATIVE_HOST = "org.kde.plasma.thunderbird_calendar";
 const REFRESH_INTERVAL_MS = 3 * 60 * 1000;
+const RECONNECT_BASE_MS = 15 * 1000;
+const RECONNECT_MAX_MS = 15 * 60 * 1000;
 const LOOK_BEHIND_DAYS = 180;
 const LOOK_AHEAD_DAYS = 730;
 
 let nativePort = null;
 let refreshInProgress = false;
 let reconnectTimer = null;
+let reconnectDelayMs = RECONNECT_BASE_MS;
 
 function makeDateWindow() {
   const now = Date.now();
@@ -40,7 +43,10 @@ function scheduleReconnect() {
   if (reconnectTimer !== null) {
     clearTimeout(reconnectTimer);
   }
-  reconnectTimer = setTimeout(connectNativeHost, 15000);
+  // Back off exponentially so a host that keeps failing does not trigger a
+  // full calendar snapshot every few seconds.
+  reconnectTimer = setTimeout(connectNativeHost, reconnectDelayMs);
+  reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_MAX_MS);
 }
 
 function connectNativeHost() {
@@ -48,7 +54,9 @@ function connectNativeHost() {
   try {
     nativePort = browser.runtime.connectNative(NATIVE_HOST);
     nativePort.onMessage.addListener(message => {
-      if (message && message.ok === false) {
+      if (message && message.ok === true) {
+        reconnectDelayMs = RECONNECT_BASE_MS;
+      } else if (message && message.ok === false) {
         console.error("Thunderbird Plasma Calendar native host:", message.error || "unknown error");
       }
     });
