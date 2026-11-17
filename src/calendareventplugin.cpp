@@ -32,7 +32,7 @@ QDateTime parseDateTime(const QString &value, bool allDay)
 {
     if (allDay) {
         const QDate date = QDate::fromString(value.left(10), Qt::ISODate);
-        return date.isValid() ? QDateTime(date, QTime(0, 0), Qt::LocalTime) : QDateTime();
+        return date.isValid() ? date.startOfDay() : QDateTime();
     }
     QDateTime result = QDateTime::fromString(value, Qt::ISODateWithMs);
     if (!result.isValid()) {
