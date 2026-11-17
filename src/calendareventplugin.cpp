@@ -38,7 +38,20 @@ QDateTime parseDateTime(const QString &value, bool allDay)
     if (!result.isValid()) {
         result = QDateTime::fromString(value, Qt::ISODate);
     }
-    return result;
+    // Timed values arrive as UTC instants. Convert so that date() is the local
+    // calendar day the clock should place the event on.
+    return result.isValid() ? result.toLocalTime() : result;
+}
+
+// Last calendar day an event occupies. Both iCal all-day DTEND values and
+// timed events ending exactly at midnight are exclusive.
+QDate lastDayOf(const QDateTime &start, const QDateTime &end, bool allDay)
+{
+    QDate last = end.date();
+    if (end > start && (allDay || end.time() == QTime(0, 0))) {
+        last = last.addDays(-1);
+    }
+    return last < start.date() ? start.date() : last;
 }
 
 QStringList enabledCalendars(bool *hasExplicitSelection)
@@ -108,7 +121,9 @@ void ThunderbirdCalendarEventsPlugin::publishCurrentRange()
                     if (!start.isValid() || !end.isValid()) {
                         continue;
                     }
-                    if (end.date() < m_startDate || start.date() > m_endDate) {
+                    const QDate firstDay = start.date();
+                    const QDate lastDay = lastDayOf(start, end, allDay);
+                    if (lastDay < m_startDate || firstDay > m_endDate) {
                         continue;
                     }
 
@@ -124,7 +139,12 @@ void ThunderbirdCalendarEventsPlugin::publishCurrentRange()
                     event.setEventType(type == QStringLiteral("todo")
                                            ? CalendarEvents::EventData::Todo
                                            : CalendarEvents::EventData::Event);
-                    result.insert(start.date(), event);
+                    // Publish the event on every visible day it spans.
+                    const QDate from = qMax(firstDay, m_startDate);
+                    const QDate to = qMin(lastDay, m_endDate);
+                    for (QDate day = from; day <= to; day = day.addDays(1)) {
+                        result.insert(day, event);
+                    }
                 }
             }
         }

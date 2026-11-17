@@ -16,6 +16,7 @@
 #include <QStandardPaths>
 #include <QtEndian>
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <iostream>
@@ -150,9 +151,29 @@ int main(int argc, char **argv)
         quint32 length = 0;
         std::memcpy(&length, header.data(), sizeof(length));
         length = qFromLittleEndian(length);
-        if (length == 0 || length > MaxMessageBytes) {
+        if (length == 0) {
             std::cerr << "Invalid native-messaging frame size\n";
             return 2;
+        }
+        if (length > MaxMessageBytes) {
+            // Discard the oversized payload so the stream stays in sync and
+            // report the problem to the extension. Exiting here would make the
+            // extension reconnect and resend the same oversized snapshot.
+            std::array<char, 64 * 1024> scratch{};
+            quint32 remaining = length;
+            while (remaining > 0) {
+                const auto chunk = static_cast<std::streamsize>(std::min(remaining, static_cast<quint32>(scratch.size())));
+                std::cin.read(scratch.data(), chunk);
+                if (std::cin.gcount() != chunk) {
+                    std::cerr << "Incomplete native-messaging frame payload\n";
+                    return 2;
+                }
+                remaining -= static_cast<quint32>(chunk);
+            }
+            if (!writeFrame({{QStringLiteral("ok"), false}, {QStringLiteral("error"), QStringLiteral("snapshot too large")}})) {
+                return 3;
+            }
+            continue;
         }
 
         QByteArray payload(static_cast<qsizetype>(length), Qt::Uninitialized);
