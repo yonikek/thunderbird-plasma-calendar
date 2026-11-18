@@ -1,5 +1,8 @@
 # Thunderbird calendars in KDE Plasma's Digital Clock
 
+<img width="2085" height="1011" alt="Screenshot_20261118_000610" src="https://github.com/user-attachments/assets/3ae24623-3175-4b41-9679-12a62800785b" />
+
+
 A read-only integration that shows calendars configured in Mozilla Thunderbird in
 the Plasma 6 Digital Clock, as a `CalendarEvents` provider. It sits beside KDE's
 Akonadi/PIM Events provider; it does not modify Plasma and does not need Akonadi.
