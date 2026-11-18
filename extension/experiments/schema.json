@@ -7,9 +7,23 @@
         "type": "function",
         "async": true,
         "parameters": [
-          { "name": "startIso", "type": "string" },
-          { "name": "endIso", "type": "string" }
+          {
+            "name": "startIso",
+            "type": "string"
+          },
+          {
+            "name": "endIso",
+            "type": "string"
+          }
         ]
+      }
+    ],
+    "events": [
+      {
+        "name": "onChanged",
+        "type": "function",
+        "description": "Fires when calendars or calendar items change. May fire in bursts; callers should debounce.",
+        "parameters": []
       }
     ]
   }
