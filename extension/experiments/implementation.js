@@ -81,6 +81,34 @@ function serializeItem(item, calendar, calendarId) {
   };
 }
 
+// Calendar properties that appear in the exported snapshot. Other property
+// changes (sync tokens, last-refresh times, ...) happen constantly and are
+// not worth a refresh.
+const WATCHED_PROPERTIES = new Set(["name", "color", "disabled"]);
+
+function createObservers(notify) {
+  const watched = name => WATCHED_PROPERTIES.has(String(name).toLowerCase());
+  const calendarObserver = {
+    QueryInterface: ChromeUtils.generateQI(["calIObserver"]),
+    onStartBatch() {},
+    onEndBatch() { notify(); },
+    onLoad() { notify(); },
+    onAddItem() { notify(); },
+    onModifyItem() { notify(); },
+    onDeleteItem() { notify(); },
+    onError() {},
+    onPropertyChanged(calendar, name) { if (watched(name)) { notify(); } },
+    onPropertyDeleting(calendar, name) { if (watched(name)) { notify(); } }
+  };
+  const managerObserver = {
+    QueryInterface: ChromeUtils.generateQI(["calICalendarManagerObserver"]),
+    onCalendarRegistered() { notify(); },
+    onCalendarUnregistering() { notify(); },
+    onCalendarDeleting() { notify(); }
+  };
+  return { calendarObserver, managerObserver };
+}
+
 var tbCalendarBridge = class extends ExtensionCommon.ExtensionAPI {
   getAPI(context) {
     return {
@@ -138,7 +166,28 @@ var tbCalendarBridge = class extends ExtensionCommon.ExtensionAPI {
             rangeEnd: endIso,
             calendars
           };
-        }
+        },
+
+        onChanged: new ExtensionCommon.EventManager({
+          context,
+          name: "tbCalendarBridge.onChanged",
+          register(fire) {
+            const notify = () => {
+              try {
+                fire.async();
+              } catch (error) {
+                console.error("Thunderbird Plasma Calendar: change notification failed:", error);
+              }
+            };
+            const { calendarObserver, managerObserver } = createObservers(notify);
+            cal.manager.addCalendarObserver(calendarObserver);
+            cal.manager.addObserver(managerObserver);
+            return () => {
+              cal.manager.removeCalendarObserver(calendarObserver);
+              cal.manager.removeObserver(managerObserver);
+            };
+          }
+        }).api()
       }
     };
   }

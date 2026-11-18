@@ -4,6 +4,7 @@
  * It accepts snapshots only; it cannot execute commands or choose file paths.
  */
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QDBusConnection>
 #include <QDBusMessage>
 #include <QDir>
@@ -83,6 +84,33 @@ void notifyPlasma()
     QCoreApplication::processEvents();
 }
 
+// Digest of a snapshot's calendar content. generatedAt and the query range are
+// regenerated on every refresh, so they are excluded; QJsonObject keeps its
+// keys sorted, which makes the compact serialisation deterministic.
+QByteArray contentDigest(QJsonObject snapshot)
+{
+    snapshot.remove(QStringLiteral("generatedAt"));
+    snapshot.remove(QStringLiteral("rangeStart"));
+    snapshot.remove(QStringLiteral("rangeEnd"));
+    return QCryptographicHash::hash(QJsonDocument(snapshot).toJson(QJsonDocument::Compact), QCryptographicHash::Sha256);
+}
+
+QByteArray digestOfFile(const QString &path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return {};
+    }
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(file.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+        return {};
+    }
+    return contentDigest(document.object());
+}
+
+QByteArray lastWrittenDigest;
+
 bool acceptSnapshot(const QJsonObject &message, QString *error)
 {
     if (message.value(QStringLiteral("type")).toString() != QStringLiteral("snapshot")) {
@@ -110,7 +138,18 @@ bool acceptSnapshot(const QJsonObject &message, QString *error)
         return false;
     }
 
-    QSaveFile file(directory + QStringLiteral("/events.json"));
+    // Skip the rewrite and the D-Bus signal when nothing but timestamps changed.
+    // Plasma re-parses the whole file on every signal.
+    const QString cachePath = directory + QStringLiteral("/events.json");
+    const QByteArray digest = contentDigest(snapshot);
+    if (lastWrittenDigest.isEmpty()) {
+        lastWrittenDigest = digestOfFile(cachePath);
+    }
+    if (digest == lastWrittenDigest && QFile::exists(cachePath)) {
+        return true;
+    }
+
+    QSaveFile file(cachePath);
     if (!file.open(QIODevice::WriteOnly)) {
         *error = file.errorString();
         return false;
@@ -126,6 +165,7 @@ bool acceptSnapshot(const QJsonObject &message, QString *error)
         *error = file.errorString();
         return false;
     }
+    lastWrittenDigest = digest;
     notifyPlasma();
     return true;
 }

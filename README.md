@@ -30,9 +30,16 @@ Plasma CalendarEvents plugin (C++ / Qt)
 - The host is not a daemon. Thunderbird starts it when the add-on connects and it
   exits when Thunderbird closes. Plasma reads the last cache written, so synced
   events stay visible while Thunderbird is closed.
-- The extension refreshes the cache every three minutes (180 days back, 730 days
-  ahead). If the host keeps failing, reconnect attempts back off exponentially
-  from 15 seconds up to 15 minutes.
+- The Experiment API observes Thunderbird's calendar manager and notifies the
+  extension when calendars or items change. The extension debounces bursts (such
+  as a CalDAV sync): it refreshes after 2.5 seconds of quiet, and at most 30
+  seconds after the first change. A 15-minute poll remains as a safety net.
+  Snapshots cover 180 days back and 730 days ahead.
+- The host skips the cache write and the D-Bus signal when a snapshot differs
+  from the cached one only in timestamps, so Plasma does not re-parse the file
+  needlessly.
+- If the host keeps failing, reconnect attempts back off exponentially from 15
+  seconds up to 15 minutes.
 - The host accepts only a `snapshot` message: no paths, commands or method names.
   The host manifest allows only this add-on's exact extension ID.
 - The XPI builder clamps ZIP timestamps to the supported range (Nix sources use
@@ -277,7 +284,9 @@ The proxy log should show a `GetManifest` or `Start` request for
   the QML settings UI and proxy integration need testing against your versions.
 - The Experiment API uses internal Thunderbird interfaces that can change between
   major releases.
-- Refresh is polled every three minutes, not event-driven.
+- Updates are as fast as Thunderbird's own: local edits appear within seconds, but
+  changes on a server appear only when Thunderbird next syncs that calendar.
+  Thunderbird must be running.
 - Only events from 180 days back to 730 days ahead are exported.
 - Read-only: no creating, editing, deleting or RSVP.
 - The cache holds event titles and descriptions **unencrypted** in the user cache
