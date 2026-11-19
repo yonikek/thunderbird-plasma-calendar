@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Thunderbird Calendar for KDE Plasma</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <h1>Calendar range</h1>
+  <p>
+    Events from this window around today are sent to the Plasma Digital Clock.
+    Larger windows use more memory and make each refresh slower. Changes are
+    saved automatically and reach Plasma within a few seconds.
+  </p>
+  <form id="form">
+    <label for="lookBehindDays">Days in the past</label>
+    <input type="number" id="lookBehindDays" step="1" inputmode="numeric">
+    <label for="lookAheadDays">Days in the future</label>
+    <input type="number" id="lookAheadDays" step="1" inputmode="numeric">
+    <div class="actions">
+      <button type="button" id="reset">Restore defaults</button>
+    </div>
+    <p id="status" role="status"></p>
+  </form>
+  <script src="../settings.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>

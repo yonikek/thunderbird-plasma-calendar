@@ -14,12 +14,17 @@
     "48": "icons/calendar.png"
   },
   "permissions": [
-    "nativeMessaging"
+    "nativeMessaging",
+    "storage"
   ],
   "background": {
     "scripts": [
+      "settings.js",
       "background.js"
     ]
+  },
+  "options_ui": {
+    "page": "options/options.html"
   },
   "experiment_apis": {
     "tbCalendarBridge": {

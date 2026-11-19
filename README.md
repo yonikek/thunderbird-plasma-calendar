@@ -34,7 +34,8 @@ Plasma CalendarEvents plugin (C++ / Qt)
   extension when calendars or items change. The extension debounces bursts (such
   as a CalDAV sync): it refreshes after 2.5 seconds of quiet, and at most 30
   seconds after the first change. A 15-minute poll remains as a safety net.
-  Snapshots cover 180 days back and 730 days ahead.
+  The exported window defaults to 90 days back and 360 days ahead and can be
+  changed in the add-on's options (see [Options](#options)).
 - The host skips the cache write and the D-Bus signal when a snapshot differs
   from the cached one only in timestamps, so Plasma does not re-parse the file
   needlessly.
@@ -49,7 +50,7 @@ Repository layout:
 
 | Path | Purpose |
 | --- | --- |
-| `extension/` | MV2 MailExtension and a narrow Experiment API |
+| `extension/` | MV2 MailExtension, options page and a narrow Experiment API (kept in a private closure) |
 | `src/nativehost.cpp` | native-messaging host, cache writer, D-Bus notifier |
 | `src/calendareventplugin.*` | Plasma plugin (`thunderbirdcalendar`) |
 | `src/calendarconfigmodel.*`, `ThunderbirdCalendarConfig.qml` | per-calendar selection in Calendar settings |
@@ -114,9 +115,9 @@ Thunderbird will ask for **full, unrestricted access to Thunderbird and your
 computer**. That is inherent to Experiment APIs: there is no supported calendar
 API for ordinary MailExtensions. Only install the add-on if you trust the source.
 
-The XPI is **unsigned**. Release builds normally require signed add-ons; if yours
-rejects it, check its signing policy rather than loosening security settings in
-your everyday profile.
+The XPI is **unsigned**. It installed on the Flathub release build in testing, but
+whether unsigned permanent installs are accepted may depend on the build. If the
+add-on is disabled or disappears after a restart, see Troubleshooting.
 
 ## NixOS
 
@@ -258,6 +259,15 @@ journalctl --user -u xdg-native-messaging-proxy -n 50
 The proxy log should show a `GetManifest` or `Start` request for
 `org.kde.plasma.thunderbird_calendar` when the add-on connects.
 
+## Options
+
+Open **Add-ons and Themes**, find *Thunderbird Calendar for KDE Plasma* and choose
+**Options** (or **Preferences**). You can set how many days into the past (0 to
+365, default 90) and the future (1 to 1095, default 360) are exported. Values are
+saved automatically, out-of-range values are adjusted, and a change reaches Plasma
+within a few seconds. Large windows increase memory use and snapshot size; the
+host rejects snapshots over 32 MiB.
+
 ## Troubleshooting
 
 - **No events:** check Thunderbird's Error Console for `Thunderbird Plasma
@@ -275,6 +285,10 @@ The proxy log should show a `GetManifest` or `Start` request for
   searched location (on NixOS: `systemctl --user cat xdg-native-messaging-proxy`
   and look at `XNMP_HOST_LOCATIONS`), the override is applied, the Gecko
   preference is `2`, and the proxy journal.
+- **The add-on disappears after restarting Thunderbird:** quit with File → Quit
+  rather than `flatpak kill`, and wait a few seconds after installing before
+  closing, because Thunderbird writes its add-on registry shortly after a
+  change. Check `about:profiles` that you are using the same profile each time.
 - **Plugin not listed in Plasma:** verify the `.so` is in a Qt 6
   `plasmacalendarplugins` directory and restart Plasma.
 
@@ -284,10 +298,14 @@ The proxy log should show a `GetManifest` or `Start` request for
   the QML settings UI and proxy integration need testing against your versions.
 - The Experiment API uses internal Thunderbird interfaces that can change between
   major releases.
+- Thunderbird has signalled that it intends to stop honouring Experiment APIs on
+  release builds (gated by `extensions.experiments.suppressed`, reportedly
+  targeting the 2027 ESR). This project depends on Experiments to read the
+  calendar, so check the Thunderbird release notes before upgrading.
 - Updates are as fast as Thunderbird's own: local edits appear within seconds, but
   changes on a server appear only when Thunderbird next syncs that calendar.
   Thunderbird must be running.
-- Only events from 180 days back to 730 days ahead are exported.
+- Only events inside the configured window are exported (default 90 days back, 360 days ahead).
 - Read-only: no creating, editing, deleting or RSVP.
 - The cache holds event titles and descriptions **unencrypted** in the user cache
   (directory 0700, file 0600). Consider this for calendars with sensitive data.

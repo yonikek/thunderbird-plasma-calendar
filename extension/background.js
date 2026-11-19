@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 "use strict";
 
+// CalendarSettings (settings.js) is loaded before this script.
+
 const NATIVE_HOST = "org.kde.plasma.thunderbird_calendar";
 // Changes are pushed by the Experiment API; the interval is only a safety net.
 const REFRESH_INTERVAL_MS = 15 * 60 * 1000;
@@ -11,8 +13,6 @@ const CHANGE_DEBOUNCE_MS = 2500;
 const CHANGE_MAX_WAIT_MS = 30 * 1000;
 const RECONNECT_BASE_MS = 15 * 1000;
 const RECONNECT_MAX_MS = 15 * 60 * 1000;
-const LOOK_BEHIND_DAYS = 180;
-const LOOK_AHEAD_DAYS = 730;
 
 let nativePort = null;
 let refreshInProgress = false;
@@ -22,11 +22,12 @@ let firstPendingAt = 0;
 let reconnectTimer = null;
 let reconnectDelayMs = RECONNECT_BASE_MS;
 
-function makeDateWindow() {
+async function makeDateWindow() {
+  const { lookBehindDays, lookAheadDays } = await CalendarSettings.load();
   const now = Date.now();
   return {
-    start: new Date(now - LOOK_BEHIND_DAYS * 86400000).toISOString(),
-    end: new Date(now + LOOK_AHEAD_DAYS * 86400000).toISOString()
+    start: new Date(now - lookBehindDays * 86400000).toISOString(),
+    end: new Date(now + lookAheadDays * 86400000).toISOString()
   };
 }
 
@@ -41,7 +42,7 @@ async function refreshCalendarCache() {
   }
   refreshInProgress = true;
   try {
-    const range = makeDateWindow();
+    const range = await makeDateWindow();
     const snapshot = await browser.tbCalendarBridge.getSnapshot(range.start, range.end);
     if (nativePort) {
       nativePort.postMessage({ type: "snapshot", snapshot });
@@ -107,5 +108,11 @@ function connectNativeHost() {
 }
 
 browser.tbCalendarBridge.onChanged.addListener(requestRefresh);
+// The options page changes the exported date range.
+browser.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && Object.keys(changes).some(key => key in CalendarSettings.DEFAULTS)) {
+    requestRefresh();
+  }
+});
 connectNativeHost();
 setInterval(refreshCalendarCache, REFRESH_INTERVAL_MS);
