@@ -3,8 +3,14 @@
 
 // Shared by the background script and the options page.
 const CalendarSettings = (() => {
-  // How far around "now" calendar items are exported to Plasma.
-  const DEFAULTS = Object.freeze({ lookBehindDays: 90, lookAheadDays: 360 });
+  // How far around "now" calendar items are exported to Plasma, and which
+  // optional text fields are included.
+  const DEFAULTS = Object.freeze({
+    lookBehindDays: 90,
+    lookAheadDays: 360,
+    exportDescriptions: true,
+    exportLocations: false
+  });
   // Larger windows mean larger snapshots (the native host rejects snapshots
   // over 32 MiB) and more work for Thunderbird and the Plasma plugin.
   const LIMITS = Object.freeze({
@@ -23,11 +29,17 @@ const CalendarSettings = (() => {
     return Math.min(LIMITS[key].max, Math.max(LIMITS[key].min, number));
   }
 
+  function toBoolean(value, key) {
+    return typeof value === "boolean" ? value : DEFAULTS[key];
+  }
+
   function normalize(raw) {
     const source = raw || {};
     return {
       lookBehindDays: clampDays(source.lookBehindDays, "lookBehindDays"),
-      lookAheadDays: clampDays(source.lookAheadDays, "lookAheadDays")
+      lookAheadDays: clampDays(source.lookAheadDays, "lookAheadDays"),
+      exportDescriptions: toBoolean(source.exportDescriptions, "exportDescriptions"),
+      exportLocations: toBoolean(source.exportLocations, "exportLocations")
     };
   }
 

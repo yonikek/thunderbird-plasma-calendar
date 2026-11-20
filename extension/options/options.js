@@ -3,9 +3,10 @@
 
 const KEYS = Object.keys(CalendarSettings.DEFAULTS);
 const inputs = Object.fromEntries(KEYS.map(key => [key, document.getElementById(key)]));
+const isCheckbox = key => typeof CalendarSettings.DEFAULTS[key] === "boolean";
 const status = document.getElementById("status");
 
-for (const key of KEYS) {
+for (const key of KEYS.filter(key => !isCheckbox(key))) {
   const { min, max } = CalendarSettings.LIMITS[key];
   inputs[key].min = String(min);
   inputs[key].max = String(max);
@@ -14,15 +15,21 @@ for (const key of KEYS) {
 
 function show(values) {
   for (const key of KEYS) {
-    inputs[key].value = String(values[key]);
+    if (isCheckbox(key)) {
+      inputs[key].checked = Boolean(values[key]);
+    } else {
+      inputs[key].value = String(values[key]);
+    }
   }
 }
 
 async function saveFromInputs() {
-  const raw = Object.fromEntries(KEYS.map(key => [key, inputs[key].value]));
+  const raw = Object.fromEntries(
+    KEYS.map(key => [key, isCheckbox(key) ? inputs[key].checked : inputs[key].value])
+  );
   try {
     const saved = await CalendarSettings.save(raw);
-    const adjusted = KEYS.some(key => raw[key].trim() !== String(saved[key]));
+    const adjusted = KEYS.some(key => !isCheckbox(key) && raw[key].trim() !== String(saved[key]));
     show(saved);
     status.textContent = adjusted
       ? "Saved. A value was outside the allowed range or not a number and was adjusted."

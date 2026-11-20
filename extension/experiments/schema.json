@@ -14,6 +14,21 @@
           {
             "name": "endIso",
             "type": "string"
+          },
+          {
+            "name": "options",
+            "type": "object",
+            "optional": true,
+            "properties": {
+              "includeDescriptions": {
+                "type": "boolean",
+                "optional": true
+              },
+              "includeLocations": {
+                "type": "boolean",
+                "optional": true
+              }
+            }
           }
         ]
       }

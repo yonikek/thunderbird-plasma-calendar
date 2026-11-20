@@ -6,17 +6,24 @@
   <link rel="stylesheet" href="options.css">
 </head>
 <body>
-  <h1>Calendar range</h1>
+  <h1>Calendar export</h1>
   <p>
     Events from this window around today are sent to the Plasma Digital Clock.
     Larger windows use more memory and make each refresh slower. Changes are
     saved automatically and reach Plasma within a few seconds.
+  </p>
+  <p>
+    Long descriptions (over 300 characters) and locations (over 200) are
+    truncated. Locations are not shown by current Plasma versions. Turning either
+    off makes snapshots smaller and refreshes faster.
   </p>
   <form id="form">
     <label for="lookBehindDays">Days in the past</label>
     <input type="number" id="lookBehindDays" step="1" inputmode="numeric">
     <label for="lookAheadDays">Days in the future</label>
     <input type="number" id="lookAheadDays" step="1" inputmode="numeric">
+    <label class="check"><input type="checkbox" id="exportDescriptions"> Export event descriptions</label>
+    <label class="check"><input type="checkbox" id="exportLocations"> Export event locations</label>
     <div class="actions">
       <button type="button" id="reset">Restore defaults</button>
     </div>

@@ -22,12 +22,11 @@ let firstPendingAt = 0;
 let reconnectTimer = null;
 let reconnectDelayMs = RECONNECT_BASE_MS;
 
-async function makeDateWindow() {
-  const { lookBehindDays, lookAheadDays } = await CalendarSettings.load();
+function makeDateWindow(settings) {
   const now = Date.now();
   return {
-    start: new Date(now - lookBehindDays * 86400000).toISOString(),
-    end: new Date(now + lookAheadDays * 86400000).toISOString()
+    start: new Date(now - settings.lookBehindDays * 86400000).toISOString(),
+    end: new Date(now + settings.lookAheadDays * 86400000).toISOString()
   };
 }
 
@@ -42,8 +41,12 @@ async function refreshCalendarCache() {
   }
   refreshInProgress = true;
   try {
-    const range = await makeDateWindow();
-    const snapshot = await browser.tbCalendarBridge.getSnapshot(range.start, range.end);
+    const settings = await CalendarSettings.load();
+    const range = makeDateWindow(settings);
+    const snapshot = await browser.tbCalendarBridge.getSnapshot(range.start, range.end, {
+      includeDescriptions: settings.exportDescriptions,
+      includeLocations: settings.exportLocations
+    });
     if (nativePort) {
       nativePort.postMessage({ type: "snapshot", snapshot });
     }

@@ -262,11 +262,21 @@ The proxy log should show a `GetManifest` or `Start` request for
 ## Options
 
 Open **Add-ons and Themes**, find *Thunderbird Calendar for KDE Plasma* and choose
-**Options** (or **Preferences**). You can set how many days into the past (0 to
-365, default 90) and the future (1 to 1095, default 360) are exported. Values are
-saved automatically, out-of-range values are adjusted, and a change reaches Plasma
-within a few seconds. Large windows increase memory use and snapshot size; the
-host rejects snapshots over 32 MiB.
+**Options** (or **Preferences**). You can set:
+
+- how many days into the past (0 to 365, default 90) and the future (1 to 1095,
+  default 360) are exported;
+- whether event descriptions are exported (default on). Descriptions longer than
+  300 characters are truncated with an ellipsis; line breaks and spacing are kept;
+- whether event locations are exported (default off, truncated at 200 characters).
+  The plugin does not display locations yet, since current Plasma versions have no
+  place for them.
+
+Values are saved automatically, out-of-range values are adjusted, and a change
+reaches Plasma within a few seconds. Large windows increase memory use and
+snapshot size; the host rejects snapshots over 32 MiB. Turning descriptions and
+locations off makes refreshes lighter, because they are then not read from
+Thunderbird at all.
 
 ## Troubleshooting
 

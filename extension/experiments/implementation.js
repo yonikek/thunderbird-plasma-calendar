@@ -71,7 +71,49 @@ var tbCalendarBridge = (() => {
       Ci.calICalendar.ITEM_FILTER_COMPLETED_ALL;
   }
 
-  function serializeItem(item, calendar, calendarId) {
+  // Long text is truncated to keep the snapshot and the plaintext cache small
+  // when invitations carry long boilerplate. Line breaks and spacing are kept.
+  const MAX_DESCRIPTION_CHARS = 300;
+  const MAX_LOCATION_CHARS = 200;
+
+  function truncate(text, maxChars) {
+    const value = String(text);
+    if (value.length <= maxChars) {
+      return value;
+    }
+    let cut = value.slice(0, maxChars - 1);
+    if (/[\uD800-\uDBFF]$/.test(cut)) {
+      cut = cut.slice(0, -1); // do not split a surrogate pair
+    }
+    return `${cut.trimEnd()}\u2026`;
+  }
+
+  function itemDescription(item) {
+    let text = "";
+    try {
+      text = item.descriptionText;
+    } catch (error) {
+      // Older Thunderbird versions have no descriptionText.
+    }
+    if (typeof text !== "string" || text === "") {
+      try {
+        text = item.getProperty("DESCRIPTION") || "";
+      } catch (error) {
+        text = "";
+      }
+    }
+    return truncate(text, MAX_DESCRIPTION_CHARS);
+  }
+
+  function itemLocation(item) {
+    try {
+      return truncate(item.getProperty("LOCATION") || "", MAX_LOCATION_CHARS);
+    } catch (error) {
+      return "";
+    }
+  }
+
+  function serializeItem(item, calendar, calendarId, options) {
     const isTodo = typeof item.isTodo === "function"
       ? item.isTodo()
       : Boolean(item.isTodo);
@@ -82,10 +124,9 @@ var tbCalendarBridge = (() => {
 
     const recurrence = recurrenceString(item);
 
-    let description = "";
-    let location = "";
-    try { description = item.description || ""; } catch (error) {}
-    try { location = item.getProperty("LOCATION") || ""; } catch (error) {}
+    // Skipped entirely when disabled: no calls into Thunderbird, no payload.
+    const description = options.includeDescriptions ? itemDescription(item) : "";
+    const location = options.includeLocations ? itemLocation(item) : "";
 
     const calendarColor = calendarColour(calendar);
     let itemColor = "";
@@ -143,8 +184,12 @@ var tbCalendarBridge = (() => {
     getAPI(context) {
       return {
         tbCalendarBridge: {
-          async getSnapshot(startIso, endIso) {
+          async getSnapshot(startIso, endIso, options) {
             const { rangeStart, rangeEnd } = parseRange(startIso, endIso);
+            const exportOptions = {
+              includeDescriptions: !options || options.includeDescriptions !== false,
+              includeLocations: Boolean(options && options.includeLocations === true)
+            };
             const filter = itemFilter();
             const calendars = [];
 
@@ -166,7 +211,7 @@ var tbCalendarBridge = (() => {
                 const stream = calendar.getItems(filter, 0, rangeStart, rangeEnd);
                 for await (const batch of cal.iterate.streamValues(stream)) {
                   for (const item of batch) {
-                    const serialized = serializeItem(item, calendar, calendarEntry.id);
+                    const serialized = serializeItem(item, calendar, calendarEntry.id, exportOptions);
                     if (serialized) {
                       calendarEntry.events.push(serialized);
                     }
