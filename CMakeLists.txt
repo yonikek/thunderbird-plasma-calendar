@@ -89,6 +89,10 @@ add_custom_command(
         tools/build-xpi.py
         extension/manifest.json
         extension/background.js
+        extension/settings.js
+        extension/options/options.html
+        extension/options/options.css
+        extension/options/options.js
         extension/experiments/schema.json
         extension/experiments/implementation.js
         extension/icons/calendar.png
