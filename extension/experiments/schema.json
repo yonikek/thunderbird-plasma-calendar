@@ -3,39 +3,32 @@
     "namespace": "tbCalendarBridge",
     "functions": [
       {
+        "name": "setDebugLogging",
+        "type": "function",
+        "parameters": [
+          { "name": "enabled", "type": "boolean" }
+        ]
+      },
+      {
         "name": "getSnapshot",
         "type": "function",
         "async": true,
         "parameters": [
-          {
-            "name": "startIso",
-            "type": "string"
-          },
-          {
-            "name": "endIso",
-            "type": "string"
-          },
+          { "name": "startIso", "type": "string" },
+          { "name": "endIso", "type": "string" },
           {
             "name": "options",
             "type": "object",
             "optional": true,
             "properties": {
-              "includeDescriptions": {
-                "type": "boolean",
-                "optional": true
-              },
-              "includeLocations": {
-                "type": "boolean",
-                "optional": true
-              },
-              "logTiming": {
-                "type": "boolean",
-                "optional": true
-              },
-              "useCache": {
-                "type": "boolean",
-                "optional": true
-              }
+              "includeDescriptions": { "type": "boolean", "optional": true },
+              "includeLocations": { "type": "boolean", "optional": true },
+              "truncateText": { "type": "boolean", "optional": true },
+              "maxDescriptionChars": { "type": "integer", "optional": true },
+              "maxLocationChars": { "type": "integer", "optional": true },
+              "queryTimeoutSeconds": { "type": "integer", "optional": true },
+              "enableDebugLogs": { "type": "boolean", "optional": true },
+              "useCache": { "type": "boolean", "optional": true }
             }
           }
         ]

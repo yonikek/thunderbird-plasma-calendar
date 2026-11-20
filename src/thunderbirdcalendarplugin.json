@@ -3,7 +3,7 @@
     "Name": "Thunderbird Calendar",
     "Description": "Show events from calendars configured in Mozilla Thunderbird",
     "Icon": "view-calendar",
-    "Version": "0.1.0",
+    "Version": "0.2.0",
     "ServiceTypes": [ "PlasmaCalendar/Plugin" ]
   },
   "X-KDE-PlasmaCalendar-ConfigUi": "ThunderbirdCalendarConfig.qml",

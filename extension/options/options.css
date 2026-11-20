@@ -6,31 +6,123 @@
 body {
   font: message-box;
   margin: 1.5em;
-  max-width: 36em;
+  max-width: 42em;
+}
+
+main {
+  display: grid;
+  gap: 1em;
 }
 
 h1 {
   font-size: 1.4em;
-  margin-top: 0;
+  margin: 0;
 }
 
-form {
+h2 {
+  font-size: 1.15em;
+  margin: 0 0 0.45em;
+}
+
+h3 {
+  font-size: 1em;
+  margin: 1.2em 0 0.55em;
+}
+
+p {
+  margin: 0;
+  line-height: 1.4;
+}
+
+.intro,
+.section-description {
+  color: GrayText;
+}
+
+.settings-section {
+  border: 1px solid color-mix(in srgb, currentColor 22%, transparent);
+  border-radius: 0.65em;
+  padding: 1em;
   display: grid;
-  grid-template-columns: max-content 8em;
-  gap: 0.6em 1em;
+  gap: 0.7em;
+}
+
+.section-description {
+  margin-bottom: 0.3em;
+}
+
+.section-description.compact {
+  font-size: 0.92em;
+  margin-top: -0.25em;
+}
+
+.setting {
+  display: grid;
+  gap: 0.35em;
+}
+
+.setting > label {
+  font-weight: 600;
+}
+
+.range-number {
+  display: grid;
+  grid-template-columns: minmax(8em, 1fr) 6.5em;
+  gap: 0.8em;
   align-items: center;
 }
 
-.actions,
-#status {
-  grid-column: 1 / -1;
+input[type="range"] {
+  width: 100%;
+  margin: 0;
 }
 
-#status {
-  margin: 0;
-  min-height: 1.4em;
+input[type="number"] {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.help {
+  color: GrayText;
+  font-size: 0.88em;
 }
 
 .check {
-  grid-column: 1 / -1;
+  display: flex;
+  gap: 0.55em;
+  align-items: center;
+}
+
+.check input {
+  margin: 0;
+}
+
+.advanced-toggle {
+  justify-self: start;
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-start;
+  margin-top: 0.2em;
+}
+
+#status {
+  min-height: 1.4em;
+  color: GrayText;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+@media (max-width: 34em) {
+  body {
+    margin: 1em;
+  }
+
+  .range-number {
+    grid-template-columns: minmax(5em, 1fr) 5.5em;
+    gap: 0.5em;
+  }
 }

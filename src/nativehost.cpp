@@ -230,9 +230,18 @@ int main(int argc, char **argv)
             continue;
         }
 
+        const QJsonObject request = document.object();
         QString error;
-        const bool ok = acceptSnapshot(document.object(), &error);
-        if (!writeFrame({{QStringLiteral("ok"), ok}, {QStringLiteral("error"), error}})) {
+        const bool ok = acceptSnapshot(request, &error);
+        QJsonObject response{
+            {QStringLiteral("ok"), ok},
+            {QStringLiteral("error"), error},
+        };
+        const QJsonValue requestId = request.value(QStringLiteral("requestId"));
+        if (requestId.isString() || requestId.isDouble()) {
+            response.insert(QStringLiteral("requestId"), requestId);
+        }
+        if (!writeFrame(response)) {
             return 3;
         }
     }

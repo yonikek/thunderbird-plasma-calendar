@@ -7,7 +7,7 @@ A read-only integration that shows calendars configured in Mozilla Thunderbird i
 the Plasma 6 Digital Clock, as a `CalendarEvents` provider. It sits beside KDE's
 Akonadi/PIM Events provider; it does not modify Plasma and does not need Akonadi.
 
-**Status: early prototype (0.1.0).** The build and event-export path have been
+**Status: early prototype (0.2.0).** The build and event-export path have been
 smoke-tested with Thunderbird and a Plasma plugin test harness, but not across
 distributions or full desktop sessions. See [Known limitations](#known-limitations).
 
@@ -38,27 +38,33 @@ Plasma CalendarEvents plugin (C++ / Qt)
   changed in the add-on's options (see [Options](#options)).
 - The Experiment API queries each calendar in 30-day chunks, because a provider
   expands recurring events inside a single `getItems()` call that cannot be
-  interrupted. It reads items in slices of about 10 ms and yields to Thunderbird's
-  event loop between slices and chunks, so a large refresh does not freeze the
-  interface. Items that overlap a chunk boundary are exported once. A change that
+  interrupted. Up to three calendars are queried concurrently. Each chunk has a
+  configurable timeout (60 seconds by default); a timeout or provider error is
+  isolated to that calendar, while the other calendars continue. Item processing
+  yields to Thunderbird's event loop after roughly 10 ms of synchronous work.
+  Items returned more than once across chunks are exported once. A change that
   arrives during a refresh triggers one follow-up refresh.
 - Each calendar's exported events are cached in the Experiment API until that
-  calendar changes. The change observers name the calendar they concern, so after
-  an edit or sync only that calendar is read again and the others come from the
-  cache; if a notification cannot be tied to a calendar, everything is read again.
-  The exported window runs from local midnight to local midnight, so it stays the
-  same for a whole day and the cache stays valid; it moves, and every calendar is
-  read again, once a day. The 15-minute safety-net poll always reads every
-  calendar, in case a notification was missed, and so does a change to the range
-  or export options. The cache holds the exported events in memory, about the size
-  of one snapshot.
+  calendar changes. After an edit or sync only that calendar is read again; the
+  others come from cache. If a read fails, the last successful event list for the
+  same date range and export options is retained and marked stale rather than
+  replaced with an empty list. A disabled or deleted calendar is handled
+  separately. The exported window runs from local midnight to local midnight, so
+  it stays the same for a whole day; it moves, and every calendar is read again,
+  once a day. The 15-minute safety-net poll always re-reads every calendar, in
+  case a notification was missed. A change to the range or export options also
+  invalidates the affected cache entries. The cache holds the exported events in
+  memory, about the size of one snapshot.
 - The host skips the cache write and the D-Bus signal when a snapshot differs
   from the cached one only in timestamps, so Plasma does not re-parse the file
   needlessly.
 - If the host keeps failing, reconnect attempts back off exponentially from 15
   seconds up to 15 minutes.
 - The host accepts only a `snapshot` message: no paths, commands or method names.
-  The host manifest allows only this add-on's exact extension ID.
+  Each snapshot has a request ID and the host acknowledges it only after the cache
+  has been accepted (and, when necessary, atomically written). The background
+  script waits for that acknowledgement and retries failed deliveries with
+  bounded backoff. The host manifest allows only this add-on's exact extension ID.
 - The XPI builder clamps ZIP timestamps to the supported range (Nix sources use
   the 1970 epoch) and honours `SOURCE_DATE_EPOCH`.
 
@@ -277,36 +283,28 @@ The proxy log should show a `GetManifest` or `Start` request for
 
 ## Options
 
-Open **Add-ons and Themes**, find *Thunderbird Calendar for KDE Plasma* and choose
-**Options** (or **Preferences**). You can set:
+The main options page provides the number of days to look back and ahead. Use the
+**Show advanced settings** button for the remaining controls:
 
-- how many days into the past (0 to 365, default 90) and the future (1 to 1095,
-  default 360) are exported;
-- whether event descriptions are exported (default on). Descriptions longer than
-  300 characters are truncated with an ellipsis; line breaks and spacing are kept;
-- whether event locations are exported (default off, truncated at 200 characters).
-  The plugin does not display locations yet, since current Plasma versions have no
-  place for them.
+- export event descriptions (default on) and locations (default off);
+- truncate long descriptions and locations (default on), with independent maximum
+  lengths from 1 to 1000 characters (defaults 300 and 200). When truncation is
+  disabled, the complete text is exported;
+- calendar query timeout (5 to 300 seconds per 30-day query, default 60);
+- **Enable debug logs** (default off). When enabled, refresh timings and
+  calendar-provider, query and native-host errors are written to Thunderbird's
+  Error Console (Ctrl+Shift+J). When disabled, the extension does not emit these
+  diagnostic messages.
 
-- whether to log refresh timing (default off). When on, each refresh writes one line
-  to Thunderbird's Error Console (Ctrl+Shift+J) with its duration (wall-clock, including time yielded to the interface), how much of it
-  was reading calendars, the number of calendars and items, and the approximate
-  snapshot size. A second line from the Experiment API breaks the work down: the
-  number of items and queries, how many calendars were read and how many came from
-  the cache, time spent waiting for calendar providers versus
-  serialising items, the number of yields and the longest uninterrupted block.
-  Use them to compare range and export settings on your own data.
-
-Values are saved automatically, out-of-range values are adjusted, and a change
-reaches Plasma within a few seconds. Large windows increase memory use and
-snapshot size; the host rejects snapshots over 32 MiB. Turning descriptions and
-locations off makes refreshes lighter, because they are then not read from
-Thunderbird at all.
+Numeric settings have both a slider and a number field. Values are saved
+automatically and clamped to their supported ranges. The older `logTiming`
+preference is migrated to `enableDebugLogs` the next time settings are saved.
 
 ## Troubleshooting
 
-- **No events:** check Thunderbird's Error Console for `Thunderbird Plasma
-  Calendar` messages, and that `$XDG_CACHE_HOME/plasma-thunderbird-calendar/events.json`
+- **No events:** enable **Enable debug logs** in the add-on's advanced settings,
+  then check Thunderbird's Error Console for `Thunderbird Plasma Calendar`
+  messages. Also check that `$XDG_CACHE_HOME/plasma-thunderbird-calendar/events.json`
   (normally under `~/.cache`) exists.
 - **"snapshot too large":** the host rejects snapshots over 32 MiB. Disable
   calendars with very many recurring events or shorten the window in
@@ -349,7 +347,10 @@ Thunderbird at all.
 - Once you save a calendar selection, calendars added to Thunderbird later stay
   hidden until you enable them in the settings.
 - Some calendar providers may reject broad range queries or behave differently
-  with recurring events.
+  with recurring events. Query timeouts bound asynchronous stream reads; they
+  cannot interrupt synchronous work performed internally by a provider before it
+  returns a stream. Stream cancellation is best-effort because provider support
+  varies.
 
 ## Development
 
@@ -363,6 +364,22 @@ cmake --install build
 
 The host speaks Mozilla's length-prefixed JSON protocol on stdin/stdout, so do not
 run it from a terminal to inspect output.
+
+### Extension mock tests
+
+Node.js is sufficient to run the extension-side mock tests without launching
+Thunderbird:
+
+```sh
+node tests/experiment-api.cjs
+node tests/settings.cjs
+node tests/background-ack.cjs
+```
+
+These cover calendar event truncation, stale-event preservation, debug-log gating,
+batch notification coalescing, query concurrency/timeouts, settings migration,
+value clamping and request-ID acknowledgement. They do not replace testing
+against real Thunderbird calendar providers or a complete Plasma session.
 
 ## License
 
