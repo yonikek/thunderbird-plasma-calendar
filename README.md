@@ -36,6 +36,22 @@ Plasma CalendarEvents plugin (C++ / Qt)
   seconds after the first change. A 15-minute poll remains as a safety net.
   The exported window defaults to 90 days back and 360 days ahead and can be
   changed in the add-on's options (see [Options](#options)).
+- The Experiment API queries each calendar in 30-day chunks, because a provider
+  expands recurring events inside a single `getItems()` call that cannot be
+  interrupted. It reads items in slices of about 10 ms and yields to Thunderbird's
+  event loop between slices and chunks, so a large refresh does not freeze the
+  interface. Items that overlap a chunk boundary are exported once. A change that
+  arrives during a refresh triggers one follow-up refresh.
+- Each calendar's exported events are cached in the Experiment API until that
+  calendar changes. The change observers name the calendar they concern, so after
+  an edit or sync only that calendar is read again and the others come from the
+  cache; if a notification cannot be tied to a calendar, everything is read again.
+  The exported window runs from local midnight to local midnight, so it stays the
+  same for a whole day and the cache stays valid; it moves, and every calendar is
+  read again, once a day. The 15-minute safety-net poll always reads every
+  calendar, in case a notification was missed, and so does a change to the range
+  or export options. The cache holds the exported events in memory, about the size
+  of one snapshot.
 - The host skips the cache write and the D-Bus signal when a snapshot differs
   from the cached one only in timestamps, so Plasma does not re-parse the file
   needlessly.
@@ -271,6 +287,15 @@ Open **Add-ons and Themes**, find *Thunderbird Calendar for KDE Plasma* and choo
 - whether event locations are exported (default off, truncated at 200 characters).
   The plugin does not display locations yet, since current Plasma versions have no
   place for them.
+
+- whether to log refresh timing (default off). When on, each refresh writes one line
+  to Thunderbird's Error Console (Ctrl+Shift+J) with its duration (wall-clock, including time yielded to the interface), how much of it
+  was reading calendars, the number of calendars and items, and the approximate
+  snapshot size. A second line from the Experiment API breaks the work down: the
+  number of items and queries, how many calendars were read and how many came from
+  the cache, time spent waiting for calendar providers versus
+  serialising items, the number of yields and the longest uninterrupted block.
+  Use them to compare range and export settings on your own data.
 
 Values are saved automatically, out-of-range values are adjusted, and a change
 reaches Plasma within a few seconds. Large windows increase memory use and

@@ -27,6 +27,14 @@
               "includeLocations": {
                 "type": "boolean",
                 "optional": true
+              },
+              "logTiming": {
+                "type": "boolean",
+                "optional": true
+              },
+              "useCache": {
+                "type": "boolean",
+                "optional": true
               }
             }
           }

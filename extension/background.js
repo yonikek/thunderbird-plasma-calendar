@@ -17,16 +17,25 @@ const RECONNECT_MAX_MS = 15 * 60 * 1000;
 let nativePort = null;
 let refreshInProgress = false;
 let refreshQueued = false;
+// Set by the safety-net poll: re-read every calendar instead of trusting the
+// cache, in case a change notification was missed.
+let fullRefreshNext = false;
 let debounceTimer = null;
 let firstPendingAt = 0;
 let reconnectTimer = null;
 let reconnectDelayMs = RECONNECT_BASE_MS;
 
+// The window starts and ends at local midnight, so it stays the same for a whole
+// day. That lets the Experiment API reuse cached calendars between refreshes;
+// the window moves, and everything is read again, once a day.
 function makeDateWindow(settings) {
-  const now = Date.now();
+  const today = new Date(Date.now());
+  const year = today.getFullYear();
+  const month = today.getMonth();
+  const day = today.getDate();
   return {
-    start: new Date(now - settings.lookBehindDays * 86400000).toISOString(),
-    end: new Date(now + settings.lookAheadDays * 86400000).toISOString()
+    start: new Date(year, month, day - settings.lookBehindDays).toISOString(),
+    end: new Date(year, month, day + settings.lookAheadDays + 1).toISOString()
   };
 }
 
@@ -41,14 +50,23 @@ async function refreshCalendarCache() {
   }
   refreshInProgress = true;
   try {
+    const started = performance.now();
+    const useCache = !fullRefreshNext;
+    fullRefreshNext = false;
     const settings = await CalendarSettings.load();
     const range = makeDateWindow(settings);
     const snapshot = await browser.tbCalendarBridge.getSnapshot(range.start, range.end, {
       includeDescriptions: settings.exportDescriptions,
-      includeLocations: settings.exportLocations
+      includeLocations: settings.exportLocations,
+      logTiming: settings.logTiming,
+      useCache
     });
+    const read = performance.now();
     if (nativePort) {
       nativePort.postMessage({ type: "snapshot", snapshot });
+    }
+    if (settings.logTiming) {
+      logTiming(snapshot, started, read, performance.now());
     }
   } catch (error) {
     console.error("Thunderbird Plasma Calendar: calendar refresh failed:", error);
@@ -58,6 +76,25 @@ async function refreshCalendarCache() {
       refreshQueued = false;
       requestRefresh();
     }
+  }
+}
+
+// Runs after the snapshot has been sent, so its extra serialisation never
+// delays an update.
+function logTiming(snapshot, started, read, sent) {
+  try {
+    let items = 0;
+    for (const calendar of snapshot.calendars) {
+      items += calendar.events.length;
+    }
+    const kib = (JSON.stringify(snapshot).length / 1024).toFixed(1);
+    console.log(
+      `Thunderbird Plasma Calendar: refresh took ${Math.round(sent - started)} ms ` +
+      `(read ${Math.round(read - started)} ms), ${snapshot.calendars.length} calendars, ` +
+      `${items} items, about ${kib} KiB`
+    );
+  } catch (error) {
+    console.warn("Thunderbird Plasma Calendar: could not log timing:", error);
   }
 }
 
@@ -118,4 +155,7 @@ browser.storage.onChanged.addListener((changes, area) => {
   }
 });
 connectNativeHost();
-setInterval(refreshCalendarCache, REFRESH_INTERVAL_MS);
+setInterval(() => {
+  fullRefreshNext = true;
+  refreshCalendarCache();
+}, REFRESH_INTERVAL_MS);

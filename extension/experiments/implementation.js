@@ -11,6 +11,50 @@ var tbCalendarBridge = (() => {
   const { cal } = ChromeUtils.importESModule(
     "resource:///modules/calendar/calUtils.sys.mjs"
   );
+  const { setTimeout } = ChromeUtils.importESModule(
+    "resource://gre/modules/Timer.sys.mjs"
+  );
+
+  // Reading items runs in Thunderbird's parent process. Work in slices of about
+  // this many milliseconds and give the event loop a turn in between, so the
+  // user interface and other add-ons are not blocked by a large refresh.
+  const SLICE_MS = 10;
+
+  // A provider expands recurring events inside a single getItems() call, which
+  // cannot be interrupted. Query the window in chunks of this many days so each
+  // call stays short and the event loop gets a turn between calls.
+  const CHUNK_DAYS = 30;
+
+  function createYielder() {
+    const stats = { yields: 0, longestBlockMs: 0 };
+    let sliceStart = Date.now();
+    return {
+      stats,
+      async yieldIfNeeded() {
+        const elapsed = Date.now() - sliceStart;
+        if (elapsed >= SLICE_MS) {
+          stats.longestBlockMs = Math.max(stats.longestBlockMs, elapsed);
+          stats.yields++;
+          await new Promise(resolve => setTimeout(resolve, 0));
+          sliceStart = Date.now();
+        }
+      },
+      finish() {
+        stats.longestBlockMs = Math.max(stats.longestBlockMs, Date.now() - sliceStart);
+        return stats;
+      }
+    };
+  }
+
+  // Contiguous [from, to) pairs of JS Dates covering [start, end).
+  function splitRange(start, end) {
+    const chunkMs = CHUNK_DAYS * 86400000;
+    const chunks = [];
+    for (let from = start.getTime(); from < end.getTime(); from += chunkMs) {
+      chunks.push([new Date(from), new Date(Math.min(from + chunkMs, end.getTime()))]);
+    }
+    return chunks;
+  }
 
   // Calendar properties that appear in the exported snapshot. Other property
   // changes (sync tokens, last-refresh times, ...) happen constantly and are
@@ -151,46 +195,131 @@ var tbCalendarBridge = (() => {
     if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end <= start) {
       throw new Error("Invalid snapshot date range");
     }
-    return {
-      rangeStart: cal.dtz.jsDateToDateTime(start),
-      rangeEnd: cal.dtz.jsDateToDateTime(end)
-    };
+    return { start, end };
   }
 
-  function createObservers(notify) {
+  // ---- Per-calendar cache -------------------------------------------------
+  // The serialised events of each calendar are kept until that calendar
+  // changes, so a refresh only re-reads calendars that were touched. Every
+  // observer callback names the calendar it concerns; if it cannot be
+  // determined, everything is dropped to be safe.
+  const cache = new Map(); // calendar id -> { key, entry }
+  const calendarVersions = new Map(); // calendar id -> change counter
+  let globalVersion = 0;
+
+  function versionOf(calendarId) {
+    return `${globalVersion}:${calendarVersions.get(calendarId) || 0}`;
+  }
+
+  function cacheKey(startIso, endIso, exportOptions) {
+    return `${startIso}|${endIso}|${exportOptions.includeDescriptions ? 1 : 0}${exportOptions.includeLocations ? 1 : 0}`;
+  }
+
+  function invalidate(calendar) {
+    let id = null;
+    try {
+      id = calendar && calendar.id !== undefined && calendar.id !== null ? String(calendar.id) : null;
+    } catch (error) {
+      id = null;
+    }
+    if (id === null) {
+      globalVersion++;
+      cache.clear();
+      return;
+    }
+    // The counter also stops a read that is in progress from being cached.
+    calendarVersions.set(id, (calendarVersions.get(id) || 0) + 1);
+    cache.delete(id);
+  }
+
+  function itemCalendar(item) {
+    try {
+      return item ? item.calendar : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function createObservers(notify, invalidateCalendar) {
     const watched = name => WATCHED_PROPERTIES.has(String(name).toLowerCase());
+    const changed = calendar => {
+      invalidateCalendar(calendar);
+      notify();
+    };
     const calendarObserver = {
       QueryInterface: ChromeUtils.generateQI(["calIObserver"]),
       onStartBatch() {},
-      onEndBatch() { notify(); },
-      onLoad() { notify(); },
-      onAddItem() { notify(); },
-      onModifyItem() { notify(); },
-      onDeleteItem() { notify(); },
+      onEndBatch(calendar) { changed(calendar); },
+      onLoad(calendar) { changed(calendar); },
+      onAddItem(item) { changed(itemCalendar(item)); },
+      onModifyItem(newItem) { changed(itemCalendar(newItem)); },
+      onDeleteItem(item) { changed(itemCalendar(item)); },
       onError() {},
-      onPropertyChanged(calendar, name) { if (watched(name)) { notify(); } },
-      onPropertyDeleting(calendar, name) { if (watched(name)) { notify(); } }
+      onPropertyChanged(calendar, name) { if (watched(name)) { changed(calendar); } },
+      onPropertyDeleting(calendar, name) { if (watched(name)) { changed(calendar); } }
     };
     const managerObserver = {
       QueryInterface: ChromeUtils.generateQI(["calICalendarManagerObserver"]),
-      onCalendarRegistered() { notify(); },
-      onCalendarUnregistering() { notify(); },
-      onCalendarDeleting() { notify(); }
+      onCalendarRegistered(calendar) { changed(calendar); },
+      onCalendarUnregistering(calendar) { changed(calendar); },
+      onCalendarDeleting(calendar) { changed(calendar); }
     };
     return { calendarObserver, managerObserver };
   }
 
+  // One pair of observers serves both cache invalidation and the onChanged
+  // event, and is registered whether or not anything listens to the event.
+  const listeners = new Set();
+  let tracker = null;
+
+  function ensureTracker() {
+    if (tracker) {
+      return;
+    }
+    tracker = createObservers(() => {
+      for (const notify of listeners) {
+        notify();
+      }
+    }, invalidate);
+    cal.manager.addCalendarObserver(tracker.calendarObserver);
+    cal.manager.addObserver(tracker.managerObserver);
+  }
+
+  function removeTracker() {
+    if (tracker) {
+      try {
+        cal.manager.removeCalendarObserver(tracker.calendarObserver);
+        cal.manager.removeObserver(tracker.managerObserver);
+      } catch (error) {
+        console.warn("Thunderbird Plasma Calendar: could not remove observers:", error);
+      }
+      tracker = null;
+    }
+    listeners.clear();
+    cache.clear();
+  }
+
   return class extends ExtensionCommon.ExtensionAPI {
+    onShutdown() {
+      removeTracker();
+    }
+
     getAPI(context) {
+      ensureTracker();
       return {
         tbCalendarBridge: {
           async getSnapshot(startIso, endIso, options) {
-            const { rangeStart, rangeEnd } = parseRange(startIso, endIso);
+            const range = parseRange(startIso, endIso);
+            const chunks = splitRange(range.start, range.end);
             const exportOptions = {
               includeDescriptions: !options || options.includeDescriptions !== false,
               includeLocations: Boolean(options && options.includeLocations === true)
             };
+            const logTiming = Boolean(options && options.logTiming === true);
             const filter = itemFilter();
+            const yielder = createYielder();
+            const useCache = !options || options.useCache !== false;
+            const timing = { providerMs: 0, serialiseMs: 0, items: 0, queries: 0, read: 0, cached: 0 };
             const calendars = [];
 
             for (const calendar of cal.manager.getCalendars()) {
@@ -202,19 +331,60 @@ var tbCalendarBridge = (() => {
                 events: []
               };
 
+              const key = cacheKey(startIso, endIso, exportOptions);
+              const versionBefore = versionOf(calendarEntry.id);
+
               try {
                 if (calendar.getProperty("disabled") === true) {
                   calendars.push(calendarEntry);
                   continue;
                 }
 
-                const stream = calendar.getItems(filter, 0, rangeStart, rangeEnd);
-                for await (const batch of cal.iterate.streamValues(stream)) {
-                  for (const item of batch) {
-                    const serialized = serializeItem(item, calendar, calendarEntry.id, exportOptions);
-                    if (serialized) {
-                      calendarEntry.events.push(serialized);
+                const hit = useCache ? cache.get(calendarEntry.id) : undefined;
+                if (hit && hit.key === key) {
+                  calendars.push(hit.entry);
+                  timing.cached++;
+                  continue;
+                }
+                timing.read++;
+
+                // Items overlapping a chunk boundary are returned for both
+                // chunks, and undated tasks for every chunk; keep each once.
+                const seen = new Set();
+                for (const [from, to] of chunks) {
+                  await yielder.yieldIfNeeded();
+                  let started = logTiming ? Date.now() : 0;
+                  const stream = calendar.getItems(
+                    filter, 0, cal.dtz.jsDateToDateTime(from), cal.dtz.jsDateToDateTime(to)
+                  );
+                  timing.queries++;
+                  const iterator = cal.iterate.streamValues(stream)[Symbol.asyncIterator]();
+                  for (;;) {
+                    const next = await iterator.next();
+                    if (logTiming) {
+                      timing.providerMs += Date.now() - started;
                     }
+                    if (next.done) {
+                      break;
+                    }
+                    for (const item of next.value) {
+                      const key = `${item.id}\u0000${recurrenceString(item)}`;
+                      if (seen.has(key)) {
+                        continue;
+                      }
+                      seen.add(key);
+                      const serialiseStart = logTiming ? Date.now() : 0;
+                      const serialized = serializeItem(item, calendar, calendarEntry.id, exportOptions);
+                      if (logTiming) {
+                        timing.serialiseMs += Date.now() - serialiseStart;
+                      }
+                      if (serialized) {
+                        calendarEntry.events.push(serialized);
+                        timing.items++;
+                      }
+                      await yielder.yieldIfNeeded();
+                    }
+                    started = logTiming ? Date.now() : 0;
                   }
                 }
               } catch (error) {
@@ -224,7 +394,30 @@ var tbCalendarBridge = (() => {
                 console.error(`Unable to read Thunderbird calendar ${calendarEntry.name}:`, error);
                 calendarEntry.error = String(error);
               }
+              // Cache only complete reads of calendars that did not change
+              // while they were being read; otherwise read again next time.
+              if (!calendarEntry.error && versionOf(calendarEntry.id) === versionBefore) {
+                cache.set(calendarEntry.id, { key, entry: calendarEntry });
+              }
               calendars.push(calendarEntry);
+            }
+
+            // Forget calendars that no longer exist.
+            const liveIds = new Set(calendars.map(entry => entry.id));
+            for (const id of Array.from(cache.keys())) {
+              if (!liveIds.has(id)) {
+                cache.delete(id);
+              }
+            }
+
+            const stats = yielder.finish();
+            if (logTiming) {
+              console.log(
+                `Thunderbird Plasma Calendar: read ${timing.items} items in ${timing.queries} queries ` +
+                `from ${timing.read} calendars (${timing.cached} from cache); ` +
+                `provider ${timing.providerMs} ms, serialising ${timing.serialiseMs} ms, ` +
+                `${stats.yields} yields, longest uninterrupted block ${stats.longestBlockMs} ms`
+              );
             }
 
             return {
@@ -247,12 +440,10 @@ var tbCalendarBridge = (() => {
                   console.error("Thunderbird Plasma Calendar: change notification failed:", error);
                 }
               };
-              const { calendarObserver, managerObserver } = createObservers(notify);
-              cal.manager.addCalendarObserver(calendarObserver);
-              cal.manager.addObserver(managerObserver);
+              ensureTracker();
+              listeners.add(notify);
               return () => {
-                cal.manager.removeCalendarObserver(calendarObserver);
-                cal.manager.removeObserver(managerObserver);
+                listeners.delete(notify);
               };
             }
           }).api()

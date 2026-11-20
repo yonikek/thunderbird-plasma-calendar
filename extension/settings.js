@@ -9,7 +9,10 @@ const CalendarSettings = (() => {
     lookBehindDays: 90,
     lookAheadDays: 360,
     exportDescriptions: true,
-    exportLocations: false
+    exportLocations: false,
+    // Log how long each refresh takes. Off by default: it serialises the
+    // snapshot once more to report its size.
+    logTiming: false
   });
   // Larger windows mean larger snapshots (the native host rejects snapshots
   // over 32 MiB) and more work for Thunderbird and the Plasma plugin.
@@ -39,7 +42,8 @@ const CalendarSettings = (() => {
       lookBehindDays: clampDays(source.lookBehindDays, "lookBehindDays"),
       lookAheadDays: clampDays(source.lookAheadDays, "lookAheadDays"),
       exportDescriptions: toBoolean(source.exportDescriptions, "exportDescriptions"),
-      exportLocations: toBoolean(source.exportLocations, "exportLocations")
+      exportLocations: toBoolean(source.exportLocations, "exportLocations"),
+      logTiming: toBoolean(source.logTiming, "logTiming")
     };
   }
 
