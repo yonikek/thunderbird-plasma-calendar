@@ -12,6 +12,9 @@ let sentMessage = null;
 let connectedHost = null;
 const localChangeListeners = [];
 const bridgeChangeListeners = [];
+const bridgeItemChangeListeners = [];
+let initialSnapshotMessage = null;
+let sentMessages = [];
 const settings = {
   lookBehindDays: 90,
   lookAheadDays: 360,
@@ -31,9 +34,14 @@ const port = {
   onDisconnect: { addListener(listener) { onPortDisconnect = listener; } },
   postMessage(message) {
     sentMessage = message;
+    sentMessages.push(message);
+    if (message.type === "snapshot") {
+      initialSnapshotMessage = message;
+    }
     queueMicrotask(() => onPortMessage({
       ok: true,
       requestId: message.requestId,
+      appliedChanges: message.type === "eventChanges" ? message.changes.length : 0,
       hostTimingsMs: {
         frameReadMs: 2.1,
         jsonParseMs: 1.2,
@@ -69,6 +77,7 @@ const browser = {
   },
   tbCalendarBridge: {
     onChanged: { addListener(listener) { bridgeChangeListeners.push(listener); } },
+    onItemChanges: { addListener(listener) { bridgeItemChangeListeners.push(listener); } },
     setDebugLogging() {},
     async getSnapshot(start, end, options) {
       return {
@@ -130,18 +139,31 @@ vm.runInContext(
 (async () => {
   await new Promise(resolve => setTimeout(resolve, 30));
   assert.equal(connectedHost, "org.kde.plasma.thunderbird_calendar");
-  assert.ok(sentMessage, "background script sent an initial snapshot");
-  assert.equal(sentMessage.type, "snapshot");
-  assert.equal(sentMessage.debugLogs, true, "debug preference is passed to the native host");
-  assert.equal(typeof sentMessage.requestId, "string");
-  assert.equal(sentMessage.snapshot.schemaVersion, 1);
+  assert.ok(initialSnapshotMessage, "background script sent an initial snapshot");
+  assert.equal(initialSnapshotMessage.type, "snapshot");
+  assert.equal(initialSnapshotMessage.debugLogs, true, "debug preference is passed to the native host");
+  assert.equal(typeof initialSnapshotMessage.requestId, "string");
+  assert.equal(initialSnapshotMessage.snapshot.schemaVersion, 1);
   assert.equal(localChangeListeners.length, 1);
   assert.equal(bridgeChangeListeners.length, 1);
+  assert.equal(bridgeItemChangeListeners.length, 1, "background script subscribes to direct calendar item changes");
   assert.ok(logLines.some(line => line.includes("native host phases (ms)")),
     "native host phase timings are written to the extension console when debugging is enabled");
   assert.ok(logLines.some(line => line.includes("JSON parse")),
     "the phase breakdown includes JSON parsing");
-  console.log("Background test passed: request-ID acknowledgement and debug-gated native-host phase logging.");
+
+  bridgeItemChangeListeners[0]([{
+    operation: "add",
+    calendarId: "calendar-1",
+    event: { uid: "calendar-1:event-1:", title: "Direct event", start: "2026-11-21T09:00:00.000Z" }
+  }]);
+  await new Promise(resolve => setTimeout(resolve, 250));
+  const directMessage = sentMessages.find(message => message.type === "eventChanges");
+  assert.ok(directMessage, "background script sends direct item changes without requesting a full snapshot");
+  assert.equal(directMessage.changes.length, 1);
+  assert.equal(directMessage.changes[0].operation, "add");
+  assert.equal(directMessage.debugLogs, true);
+  console.log("Background test passed: initial snapshot acknowledgement, direct item-change delivery and debug-gated host timings.");
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;

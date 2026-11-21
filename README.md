@@ -2,40 +2,49 @@
 
 <img width="2085" height="1011" alt="Screenshot_20261118_000610" src="https://github.com/user-attachments/assets/3ae24623-3175-4b41-9679-12a62800785b" />
 
+> **Disclaimer:** This project is vibe coded with substantial AI assistance. It is an early prototype; review the source, permissions and behaviour carefully before relying on it.
 
 A read-only integration that shows calendars configured in Mozilla Thunderbird in
 the Plasma 6 Digital Clock, as a `CalendarEvents` provider. It sits beside KDE's
 Akonadi/PIM Events provider; it does not modify Plasma and does not need Akonadi.
 
-**Status: early prototype (0.2.2).** The build and event-export path have been
-smoke-tested with Thunderbird and a Plasma plugin test harness, but not across
-distributions or full desktop sessions. See [Known limitations](#known-limitations).
+**Status: early prototype (0.4.4).** The extension and native-host protocol have
+automated mock/integration tests. The incremental CalendarEvents plugin still
+needs verification in a complete Plasma desktop session. See [Known limitations](#known-limitations).
 
 ## How it works
 
 ```text
 Thunderbird MailExtension
-  ├─ Experiment API reads cal.manager / calICalendar
+  ├─ Experiment API reads cal.manager / calICalendar for initial/recovery snapshots
+  ├─ calendar observers serialize the actual added/modified/deleted items
   └─ runtime.connectNative()  ── Mozilla native-messaging framing (JSON)
            ▼
 Native messaging host (C++ / Qt)
-  ├─ validates a snapshot-only message
-  ├─ atomically writes ~/.cache/plasma-thunderbird-calendar/events.json
-  └─ emits org.kde.ThunderbirdCalendar.EventsChanged on the session bus
+  ├─ validates and atomically persists the full recovery snapshot
+  ├─ applies compact item-level changes directly to its cached snapshot
+  └─ emits revisioned, batched event-level deltas over the session D-Bus
            ▼
 Plasma CalendarEvents plugin (C++ / Qt)
-  └─ publishes events to the Digital Clock
+  ├─ reads the full snapshot only for initial/date-range loading
+  └─ maps add / modify / remove deltas to CalendarEvents signals
+           ▼
+Plasma DaysModel (single owner of displayed event data)
 ```
 
 - The host is not a daemon. Thunderbird starts it when the add-on connects and it
   exits when Thunderbird closes. Plasma reads the last cache written, so synced
   events stay visible while Thunderbird is closed.
-- The Experiment API observes Thunderbird's calendar manager and notifies the
-  extension when calendars or items change. The extension debounces bursts (such
-  as a CalDAV sync): it refreshes after 2.5 seconds of quiet, and at most 30
-  seconds after the first change. A 15-minute poll remains as a safety net.
-  The exported window defaults to 90 days back and 360 days ahead and can be
-  changed in the add-on's options (see [Options](#options)).
+- The Experiment API observes Thunderbird's calendar manager and calendar-item
+  callbacks. Ordinary item additions, modifications and deletions are serialized
+  directly from the observer arguments; they do not trigger another `getItems()`
+  query. The background script coalesces changes by calendar ID and stable event
+  UID for 120 ms, then sends the compact batch to the native host. Thunderbird
+  batch callbacks are coalesced before they leave the Experiment API. Calendar
+  metadata changes, provider errors, missed/unsupported observer states, settings
+  changes and recovery still request a full snapshot. A 15-minute safety poll
+  remains. The exported window defaults to 90 days back and 360 days ahead and can
+  be changed in the add-on's options (see [Options](#options)).
 - The Experiment API queries each calendar in 30-day chunks, because a provider
   expands recurring events inside a single `getItems()` call that cannot be
   interrupted. Up to three calendars are queried concurrently. Each chunk has a
@@ -44,27 +53,59 @@ Plasma CalendarEvents plugin (C++ / Qt)
   yields to Thunderbird's event loop after roughly 10 ms of synchronous work.
   Items returned more than once across chunks are exported once. A change that
   arrives during a refresh triggers one follow-up refresh.
-- Each calendar's exported events are cached in the Experiment API until that
-  calendar changes. After an edit or sync only that calendar is read again; the
-  others come from cache. If a read fails, the last successful event list for the
-  same date range and export options is retained and marked stale rather than
-  replaced with an empty list. A disabled or deleted calendar is handled
-  separately. The exported window runs from local midnight to local midnight, so
-  it stays the same for a whole day; it moves, and every calendar is read again,
-  once a day. The 15-minute safety-net poll always re-reads every calendar, in
-  case a notification was missed. A change to the range or export options also
-  invalidates the affected cache entries. The cache holds the exported events in
-  memory, about the size of one snapshot.
-- The host skips the cache write and the D-Bus signal when a snapshot differs
-  from the cached one only in timestamps, so Plasma does not re-parse the file
-  needlessly.
+- Each calendar's exported events are cached in the Experiment API for full
+  snapshot queries. A direct item notification invalidates that calendar's cache
+  entry for the next safety refresh, but the immediate update does not reread the
+  calendar. If a full read fails, the last successful event list for the same date
+  range and export options is retained and marked stale rather than replaced with
+  an empty list. A disabled or deleted calendar is handled separately. The exported
+  window runs from local midnight to local midnight, so it stays the same for a
+  whole day; it moves, and every calendar is read again, once a day. The 15-minute
+  safety-net poll rereads every calendar in case a notification was missed. A
+  change to the range or export options also invalidates the affected cache entries.
+  The cache holds the exported events in memory, about the size of one snapshot.
+- The native host keeps the full snapshot as the recovery source. Ordinary
+  observer changes arrive as `eventChanges` messages containing only the affected
+  items. The host applies these to the affected calendar entries in its current
+  snapshot, atomically persists that recovery snapshot, and emits revisioned,
+  batched `EventsDelta` signals. It does not need to diff all 50,000 events to
+  discover a one-event change. The Plasma plugin translates additions into
+  `dataReady()`, in-place edits into `eventModified()`, and deletions into
+  `eventRemoved()`. After inserting delta additions with `dataReady()`, it emits
+  `eventModified()` for those newly inserted items as an agenda-cache invalidation:
+  Plasma's current `DaysModel` otherwise only marks the agenda cache dirty for
+  additions on today's date. This follow-up tells the agenda to refresh the exact
+  event date, including when an event is added or moved to another future day.
+  The Plasma-facing UID includes the event's local start date. Moving an event to
+  another start date therefore removes the old date identity and inserts a new one.
+  This is important because some Plasma versions defer removals; the deferred
+  old-UID removal must not remove the newly inserted event. The plugin retains
+  only its requested date range and selected calendar IDs; it does
+  not maintain a second full event collection. Each D-Bus delta batch carries
+  snapshot revisions so a range load that races with an update can ignore a delta
+  already represented in its read. A complete `EventsChanged` load is reserved
+  for first snapshot creation/recovery and normal date-range loads.
+- Multi-day events are inserted once, keyed by their start date, as required by
+  the `CalendarEventsPlugin` API. `EventData::isAllDay` is set only for single-day
+  all-day events; multi-day events leave it false as required by the `EventData`
+  documentation.
+  Consequently, a multi-day event appears once in the agenda, on its start date,
+  rather than being duplicated on every day it spans.
+- The host skips the cache write and D-Bus signal when a snapshot differs from
+  the cached one only in timestamps, so Plasma does not re-parse the file
+  needlessly. When event content does change, only the event-level delta is sent
+  over D-Bus (the full updated snapshot is still atomically persisted for recovery).
 - If the host keeps failing, reconnect attempts back off exponentially from 15
   seconds up to 15 minutes.
-- The host accepts only a `snapshot` message: no paths, commands or method names.
-  Each snapshot has a request ID and the host acknowledges it only after the cache
-  has been accepted (and, when necessary, atomically written). The background
-  script waits for that acknowledgement and retries failed deliveries with
-  bounded backoff. The host manifest allows only this add-on's exact extension ID.
+- The host accepts only two narrowly defined message types: `snapshot` for
+  initial/recovery synchronisation and `eventChanges` for item-level add/modify/
+  remove updates. It accepts no paths, commands or arbitrary method names. Every
+  message has a request ID and is acknowledged only after the host has accepted
+  the update (and, when necessary, atomically written the recovery snapshot). If
+  an item update refers to a calendar absent from the cached snapshot, the host
+  returns `FULL_SNAPSHOT_REQUIRED` and the extension rebuilds the full snapshot.
+  The background script waits for acknowledgements and retries failed deliveries
+  with bounded backoff. The host manifest allows only this add-on's exact ID.
 - The XPI builder clamps ZIP timestamps to the supported range (Nix sources use
   the 1970 epoch) and honours `SOURCE_DATE_EPOCH`.
 
@@ -73,7 +114,7 @@ Repository layout:
 | Path | Purpose |
 | --- | --- |
 | `extension/` | MV2 MailExtension, options page and a narrow Experiment API (kept in a private closure) |
-| `src/nativehost.cpp` | native-messaging host, cache writer, D-Bus notifier |
+| `src/nativehost.cpp` | native-messaging host, snapshot recovery writer, direct event updater, D-Bus delta notifier |
 | `src/calendareventplugin.*` | Plasma plugin (`thunderbirdcalendar`) |
 | `src/calendarconfigmodel.*`, `ThunderbirdCalendarConfig.qml` | per-calendar selection in Calendar settings |
 | `nix/`, `flake.nix` | Nix package, NixOS module, `xdg-native-messaging-proxy` package |
@@ -420,6 +461,35 @@ This sends a minimal valid snapshot with debug logging enabled, checks that the
 response contains the wait, frame-read and host-processing measurements, and
 checks stderr for response-frame writing and total message-handling duration. It
 uses a temporary `XDG_CACHE_HOME` so it does not overwrite the user's real cache.
+
+
+The event-delta integration test requires `dbus-run-session`, `dbus-monitor` and
+`dbus-send` in addition to the built host:
+
+```sh
+python3 tests/native-host-event-deltas.py ./build/thunderbird-calendar-native-host
+```
+
+It starts the host and monitor in a private D-Bus session. The test no longer
+uses a fixed startup sleep: it repeatedly emits a harmless readiness probe until
+this exact `dbus-monitor` process receives it, proving its match rule is active
+before the host's first `EventsChanged` signal. Its string decoder accepts both
+raw-quoted and escaped JSON renderings used by different `dbus-monitor` versions.
+It checks snapshot-based recovery and diffing, then sends an `eventChanges`
+message containing a date-moving modification and verifies direct add/modify/
+remove updates, old/new event timestamps, response revision, persistence of the
+recovery snapshot and `FULL_SNAPSHOT_REQUIRED` for a calendar missing from the
+host cache.
+
+For a live Plasma check, create a one-day event, modify its title and time, move
+it to another date, and delete it. Existing agenda entries should remain single;
+additions should appear once, edits should update in place, date moves should
+disappear from the old date and appear on the new date, and deletions should
+disappear without switching months or reopening the widget. Also test both a
+multi-day all-day event and a timed event spanning midnight: each should be
+supplied once under its start date, not once for every day it spans. A single-day
+all-day event should continue to display as an all-day entry.
+
 
 ### Checking native-host phase timings
 

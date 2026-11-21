@@ -1,20 +1,27 @@
 /*
  * SPDX-License-Identifier: GPL-2.0-or-later
  * Minimal Mozilla native-messaging host for the Thunderbird / Plasma bridge.
- * It accepts snapshots only; it cannot execute commands or choose file paths.
+ * It accepts full snapshots and item-level calendar changes only; it cannot
+ * execute commands or choose file paths. On changes it persists the updated
+ * recovery snapshot and forwards event-level deltas
+ * over D-Bus, keeping the Plasma plugin free of a second full event collection.
  */
 #include <QCoreApplication>
 #include <QCryptographicHash>
+#include <QDateTime>
 #include <QDBusConnection>
 #include <QDBusMessage>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileDevice>
+#include <QHash>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSaveFile>
+#include <QSet>
+#include <QStringList>
 #include <QStandardPaths>
 #include <QtEndian>
 
@@ -26,12 +33,14 @@
 #include <iostream>
 #include <poll.h>
 #include <unistd.h>
+#include <utility>
 
 namespace
 {
 constexpr quint32 MaxMessageBytes = 32U * 1024U * 1024U;
 constexpr int MaxCalendars = 512;
 constexpr int MaxEventsPerCalendar = 100000;
+constexpr int MaxDeltasPerSignal = 64;
 constexpr auto BusPath = "/org/kde/ThunderbirdCalendar";
 constexpr auto BusInterface = "org.kde.ThunderbirdCalendar";
 
@@ -61,7 +70,10 @@ struct HostTimings {
     double diskCommitMs = 0.0;
     double dbusNotifyMs = 0.0;
     double hostProcessingMs = 0.0;
+    double eventDiffMs = 0.0;
+    qint64 eventDeltaCount = 0;
     qint64 cacheWriteBytes = 0;
+    QString revision;
     bool unchanged = false;
 
     QJsonObject toJson() const
@@ -79,7 +91,10 @@ struct HostTimings {
             {QStringLiteral("diskCommitMs"), diskCommitMs},
             {QStringLiteral("dbusNotifyMs"), dbusNotifyMs},
             {QStringLiteral("hostProcessingMs"), hostProcessingMs},
+            {QStringLiteral("eventDiffMs"), eventDiffMs},
+            {QStringLiteral("eventDeltaCount"), static_cast<double>(eventDeltaCount)},
             {QStringLiteral("cacheWriteBytes"), static_cast<double>(cacheWriteBytes)},
+            {QStringLiteral("revision"), revision},
             {QStringLiteral("unchanged"), unchanged},
         };
     }
@@ -107,13 +122,23 @@ bool validateSnapshot(const QJsonObject &snapshot, QString *why)
             *why = QStringLiteral("invalid calendar entry: id must be a string and events must be an array");
             return false;
         }
-        const int eventCount = calendar.value(QStringLiteral("events")).toArray().size();
+        const QJsonArray events = calendar.value(QStringLiteral("events")).toArray();
+        const int eventCount = events.size();
         if (eventCount > MaxEventsPerCalendar) {
             *why = QStringLiteral("calendar '%1' contains %2 events; host limit is %3 per calendar")
                 .arg(calendar.value(QStringLiteral("name")).toString(calendar.value(QStringLiteral("id")).toString()))
                 .arg(eventCount)
                 .arg(MaxEventsPerCalendar);
             return false;
+        }
+        for (const QJsonValue &eventValue : events) {
+            if (!eventValue.isObject()
+                || !eventValue.toObject().value(QStringLiteral("uid")).isString()
+                || eventValue.toObject().value(QStringLiteral("uid")).toString().isEmpty()) {
+                *why = QStringLiteral("calendar '%1' contains an event without a stable UID")
+                    .arg(calendar.value(QStringLiteral("id")).toString());
+                return false;
+            }
         }
     }
     return true;
@@ -201,7 +226,41 @@ void notifyPlasma()
 {
     QDBusMessage signal = QDBusMessage::createSignal(
         QString::fromLatin1(BusPath), QString::fromLatin1(BusInterface), QStringLiteral("EventsChanged"));
-    QDBusConnection::sessionBus().send(signal);
+    if (!QDBusConnection::sessionBus().send(signal)) {
+        std::cerr << "Thunderbird Plasma Calendar: could not send initial EventsChanged signal\n";
+    }
+    QCoreApplication::processEvents();
+}
+
+void notifyEventDeltas(const QJsonArray &deltas, const QString &previousRevision, const QString &revision)
+{
+    // Emit an empty batch too when only non-event snapshot metadata changed.
+    // It advances the plugin's revision so the next real delta has a valid base.
+    const qsizetype batchCount = std::max<qsizetype>(1,
+        (deltas.size() + MaxDeltasPerSignal - 1) / MaxDeltasPerSignal);
+    const QDBusConnection bus = QDBusConnection::sessionBus();
+    for (qsizetype batchIndex = 0; batchIndex < batchCount; ++batchIndex) {
+        QJsonArray batch;
+        const qsizetype offset = batchIndex * MaxDeltasPerSignal;
+        const qsizetype end = std::min<qsizetype>(offset + MaxDeltasPerSignal, deltas.size());
+        for (qsizetype index = offset; index < end; ++index) {
+            batch.append(deltas.at(index));
+        }
+        const QJsonObject envelope{
+            {QStringLiteral("schemaVersion"), 1},
+            {QStringLiteral("previousRevision"), previousRevision},
+            {QStringLiteral("revision"), revision},
+            {QStringLiteral("batchIndex"), static_cast<int>(batchIndex)},
+            {QStringLiteral("batchCount"), static_cast<int>(batchCount)},
+            {QStringLiteral("deltas"), batch},
+        };
+        QDBusMessage signal = QDBusMessage::createSignal(
+            QString::fromLatin1(BusPath), QString::fromLatin1(BusInterface), QStringLiteral("EventsDelta"));
+        signal << QString::fromUtf8(QJsonDocument(envelope).toJson(QJsonDocument::Compact));
+        if (!bus.send(signal)) {
+            std::cerr << "Thunderbird Plasma Calendar: could not send EventsDelta D-Bus signal batch\n";
+        }
+    }
     QCoreApplication::processEvents();
 }
 
@@ -213,23 +272,105 @@ QByteArray contentDigest(QJsonObject snapshot)
     snapshot.remove(QStringLiteral("generatedAt"));
     snapshot.remove(QStringLiteral("rangeStart"));
     snapshot.remove(QStringLiteral("rangeEnd"));
+    snapshot.remove(QStringLiteral("contentRevision"));
     return QCryptographicHash::hash(QJsonDocument(snapshot).toJson(QJsonDocument::Compact), QCryptographicHash::Sha256);
 }
 
-QByteArray digestOfFile(const QString &path)
+bool readSnapshotFile(const QString &path, QJsonObject *snapshot)
 {
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) {
-        return {};
+        return false;
     }
-    const QJsonDocument document = QJsonDocument::fromJson(file.readAll());
-    if (document.isNull() || !document.isObject()) {
-        return {};
+    QJsonParseError parseError{};
+    const QJsonDocument document = QJsonDocument::fromJson(file.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+        return false;
     }
-    return contentDigest(document.object());
+    *snapshot = document.object();
+    return true;
+}
+
+struct IndexedEvent {
+    QString calendarId;
+    QJsonObject event;
+};
+
+QHash<QString, IndexedEvent> indexEvents(const QJsonObject &snapshot)
+{
+    QHash<QString, IndexedEvent> result;
+    const QJsonArray calendars = snapshot.value(QStringLiteral("calendars")).toArray();
+    for (const QJsonValue &calendarValue : calendars) {
+        const QJsonObject calendar = calendarValue.toObject();
+        const QString calendarId = calendar.value(QStringLiteral("id")).toString();
+        for (const QJsonValue &eventValue : calendar.value(QStringLiteral("events")).toArray()) {
+            const QJsonObject event = eventValue.toObject();
+            const QString uid = event.value(QStringLiteral("uid")).toString();
+            if (uid.isEmpty()) {
+                continue;
+            }
+            // Include the calendar ID in the key even though the exporter also
+            // namespaces UIDs, so malformed/migrated data cannot collide.
+            const QString key = QString::number(calendarId.size()) + QLatin1Char(':')
+                + calendarId + uid;
+            result.insert(key, IndexedEvent{calendarId, event});
+        }
+    }
+    return result;
+}
+
+QJsonArray eventDeltas(QHash<QString, IndexedEvent> &previous, const QJsonObject &nextSnapshot)
+{
+    // Keep only one UID index: consume old entries as their replacements are
+    // encountered in the new snapshot. Leftovers are removals. This avoids
+    // allocating a second full event index for the new snapshot.
+    QJsonArray deltas;
+    const QJsonArray calendars = nextSnapshot.value(QStringLiteral("calendars")).toArray();
+    for (const QJsonValue &calendarValue : calendars) {
+        const QJsonObject calendar = calendarValue.toObject();
+        const QString calendarId = calendar.value(QStringLiteral("id")).toString();
+        for (const QJsonValue &eventValue : calendar.value(QStringLiteral("events")).toArray()) {
+            const QJsonObject event = eventValue.toObject();
+            const QString uid = event.value(QStringLiteral("uid")).toString();
+            if (uid.isEmpty()) {
+                continue;
+            }
+            const QString key = QString::number(calendarId.size()) + QLatin1Char(':')
+                + calendarId + uid;
+            auto old = previous.find(key);
+            if (old == previous.end()) {
+                deltas.append(QJsonObject{
+                    {QStringLiteral("operation"), QStringLiteral("add")},
+                    {QStringLiteral("calendarId"), calendarId},
+                    {QStringLiteral("event"), event},
+                });
+            } else {
+                if (old->event != event) {
+                    deltas.append(QJsonObject{
+                        {QStringLiteral("operation"), QStringLiteral("modify")},
+                        {QStringLiteral("calendarId"), calendarId},
+                        {QStringLiteral("previous"), old->event},
+                        {QStringLiteral("event"), event},
+                    });
+                }
+                previous.erase(old);
+            }
+        }
+    }
+
+    for (auto it = previous.cbegin(); it != previous.cend(); ++it) {
+        deltas.append(QJsonObject{
+            {QStringLiteral("operation"), QStringLiteral("remove")},
+            {QStringLiteral("calendarId"), it->calendarId},
+            {QStringLiteral("event"), it->event},
+        });
+    }
+    return deltas;
 }
 
 QByteArray lastWrittenDigest;
+QJsonObject cachedSnapshot;
+bool hasCachedSnapshot = false;
 
 bool acceptSnapshot(const QJsonObject &message,
                     QString *error,
@@ -261,6 +402,7 @@ bool acceptSnapshot(const QJsonObject &message,
     phase.restart();
     const QByteArray digest = contentDigest(snapshot);
     timings->contentHashMs = phase.nsecsElapsed() / 1000000.0;
+    timings->revision = QString::fromLatin1(digest.toHex());
 
     phase.restart();
     const QString directory = cacheDirectory();
@@ -282,22 +424,63 @@ bool acceptSnapshot(const QJsonObject &message,
     timings->cacheDirectoryMs = phase.nsecsElapsed() / 1000000.0;
 
     const QString cachePath = directory + QStringLiteral("/events.json");
+    QJsonObject previousSnapshot;
+    bool hasPreviousSnapshot = false;
     phase.restart();
     if (lastWrittenDigest.isEmpty()) {
-        lastWrittenDigest = digestOfFile(cachePath);
+        hasPreviousSnapshot = readSnapshotFile(cachePath, &previousSnapshot);
+        if (hasPreviousSnapshot) {
+            lastWrittenDigest = contentDigest(previousSnapshot);
+        }
     }
     timings->existingCacheReadMs = phase.nsecsElapsed() / 1000000.0;
     timings->cachePreparationMs = timings->cacheDirectoryMs + timings->existingCacheReadMs;
 
-    // Skip the rewrite and D-Bus signal when only timestamps or the content is unchanged.
-    // Plasma re-parses the whole file on every signal.
+    // Unchanged refreshes stay cheap: once the host knows the cache digest it
+    // does not reparse the on-disk snapshot just to confirm the same content.
     if (digest == lastWrittenDigest && QFile::exists(cachePath)) {
+        if (!hasCachedSnapshot && hasPreviousSnapshot) {
+            cachedSnapshot = previousSnapshot;
+            hasCachedSnapshot = true;
+        }
         timings->unchanged = true;
         return true;
     }
 
+    QHash<QString, IndexedEvent> previousEvents;
+    QString previousRevision;
+    if (QFile::exists(cachePath)) {
+        if (!hasPreviousSnapshot) {
+            phase.restart();
+            hasPreviousSnapshot = readSnapshotFile(cachePath, &previousSnapshot);
+            timings->existingCacheReadMs += phase.nsecsElapsed() / 1000000.0;
+        }
+        if (hasPreviousSnapshot) {
+            previousRevision = previousSnapshot.value(QStringLiteral("contentRevision")).toString();
+            if (previousRevision.isEmpty()) {
+                previousRevision = QString::fromLatin1(contentDigest(previousSnapshot).toHex());
+            }
+            phase.restart();
+            previousEvents = indexEvents(previousSnapshot);
+            timings->eventDiffMs = phase.nsecsElapsed() / 1000000.0;
+            previousSnapshot = {}; // Release the old JSON tree; keep only the UID index.
+        }
+    }
+    const bool incrementalUpdate = hasPreviousSnapshot;
+    QJsonArray deltas;
+    if (incrementalUpdate) {
+        phase.restart();
+        deltas = eventDeltas(previousEvents, snapshot);
+        timings->eventDiffMs += phase.nsecsElapsed() / 1000000.0;
+        timings->eventDeltaCount = deltas.size();
+    }
+
+    QJsonObject persistedSnapshot = snapshot;
+    const QString revision = QString::fromLatin1(digest.toHex());
+    persistedSnapshot.insert(QStringLiteral("contentRevision"), revision);
+
     phase.restart();
-    const QByteArray data = QJsonDocument(snapshot).toJson(QJsonDocument::Compact);
+    const QByteArray data = QJsonDocument(persistedSnapshot).toJson(QJsonDocument::Compact);
     timings->snapshotSerializationMs = phase.nsecsElapsed() / 1000000.0;
     timings->cacheWriteBytes = data.size();
 
@@ -325,9 +508,277 @@ bool acceptSnapshot(const QJsonObject &message,
     }
     timings->diskCommitMs = phase.nsecsElapsed() / 1000000.0;
     lastWrittenDigest = digest;
+    cachedSnapshot = persistedSnapshot;
+    hasCachedSnapshot = true;
 
     phase.restart();
-    notifyPlasma();
+    if (incrementalUpdate) {
+        notifyEventDeltas(deltas, previousRevision, revision);
+    } else {
+        // The cache is being created for the first time. The CalendarEvents
+        // provider must load the full range once; later commits are incremental.
+        notifyPlasma();
+    }
+    timings->dbusNotifyMs = phase.nsecsElapsed() / 1000000.0;
+    return true;
+}
+
+bool acceptEventChanges(const QJsonObject &message,
+                        QString *error,
+                        QString *errorCode,
+                        HostTimings *timings)
+{
+    if (message.value(QStringLiteral("type")).toString() != QStringLiteral("eventChanges")) {
+        *errorCode = QStringLiteral("INVALID_MESSAGE_TYPE");
+        *error = QStringLiteral("unsupported native-host message type");
+        return false;
+    }
+
+    const QJsonValue changesValue = message.value(QStringLiteral("changes"));
+    if (!changesValue.isArray() || changesValue.toArray().isEmpty()
+        || changesValue.toArray().size() > 5000) {
+        *errorCode = QStringLiteral("INVALID_EVENT_CHANGES");
+        *error = QStringLiteral("changes must be a non-empty array containing at most 5000 entries");
+        return false;
+    }
+
+    QElapsedTimer phase;
+    phase.start();
+    const QString directory = cacheDirectory();
+    if (!QDir().mkpath(directory)) {
+        *errorCode = QStringLiteral("CACHE_DIRECTORY_ERROR");
+        *error = QStringLiteral("could not create cache directory: %1").arg(directory);
+        timings->cacheDirectoryMs = phase.nsecsElapsed() / 1000000.0;
+        return false;
+    }
+    const auto privateDirectory = QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner;
+    if (!QFile::setPermissions(directory, privateDirectory)) {
+        *errorCode = QStringLiteral("CACHE_PERMISSION_ERROR");
+        *error = QStringLiteral("could not restrict cache directory permissions: %1").arg(directory);
+        timings->cacheDirectoryMs = phase.nsecsElapsed() / 1000000.0;
+        return false;
+    }
+    timings->cacheDirectoryMs = phase.nsecsElapsed() / 1000000.0;
+
+    const QString cachePath = directory + QStringLiteral("/events.json");
+    if (!hasCachedSnapshot) {
+        phase.restart();
+        QString cacheValidationError;
+        if (!readSnapshotFile(cachePath, &cachedSnapshot)
+            || !validateSnapshot(cachedSnapshot, &cacheValidationError)) {
+            timings->existingCacheReadMs = phase.nsecsElapsed() / 1000000.0;
+            *errorCode = QStringLiteral("FULL_SNAPSHOT_REQUIRED");
+            *error = QStringLiteral("the native host has no valid recovery snapshot (%1); send a full calendar snapshot before event updates")
+                .arg(cacheValidationError.isEmpty() ? QStringLiteral("cache file is missing or unreadable") : cacheValidationError);
+            cachedSnapshot = {};
+            return false;
+        }
+        hasCachedSnapshot = true;
+        if (lastWrittenDigest.isEmpty()) {
+            lastWrittenDigest = contentDigest(cachedSnapshot);
+        }
+        timings->existingCacheReadMs = phase.nsecsElapsed() / 1000000.0;
+    }
+    timings->revision = cachedSnapshot.value(QStringLiteral("contentRevision")).toString();
+    if (timings->revision.isEmpty()) {
+        timings->revision = QString::fromLatin1(contentDigest(cachedSnapshot).toHex());
+    }
+
+    QJsonArray calendars = cachedSnapshot.value(QStringLiteral("calendars")).toArray();
+    if (calendars.isEmpty()) {
+        *errorCode = QStringLiteral("FULL_SNAPSHOT_REQUIRED");
+        *error = QStringLiteral("the recovery snapshot contains no calendars; send a full calendar snapshot first");
+        return false;
+    }
+
+    QHash<QString, int> calendarIndex;
+    for (qsizetype index = 0; index < calendars.size(); ++index) {
+        const QString id = calendars.at(index).toObject().value(QStringLiteral("id")).toString();
+        if (!id.isEmpty()) {
+            calendarIndex.insert(id, static_cast<int>(index));
+        }
+    }
+
+    // Validate all changes and group them before mutating the snapshot. A
+    // missing calendar means the host's base revision is out of date; a full
+    // snapshot is safer than silently losing a change from a newly added one.
+    QHash<QString, QHash<QString, QJsonObject>> changesByCalendar;
+    const QJsonArray changes = changesValue.toArray();
+    QElapsedTimer validationTimer;
+    validationTimer.start();
+    for (const QJsonValue &changeValue : changes) {
+        if (!changeValue.isObject()) {
+            *errorCode = QStringLiteral("INVALID_EVENT_CHANGES");
+            *error = QStringLiteral("each event change must be an object");
+            return false;
+        }
+        const QJsonObject change = changeValue.toObject();
+        const QString operation = change.value(QStringLiteral("operation")).toString();
+        const QString calendarId = change.value(QStringLiteral("calendarId")).toString();
+        const QJsonValue eventValue = change.value(QStringLiteral("event"));
+        if ((operation != QStringLiteral("add") && operation != QStringLiteral("modify")
+             && operation != QStringLiteral("remove"))
+            || calendarId.isEmpty() || !eventValue.isObject()) {
+            *errorCode = QStringLiteral("INVALID_EVENT_CHANGES");
+            *error = QStringLiteral("each change requires operation add/modify/remove, a calendarId and an event object");
+            return false;
+        }
+        const QJsonObject event = eventValue.toObject();
+        const QString uid = event.value(QStringLiteral("uid")).toString();
+        if (uid.isEmpty()
+            || !event.value(QStringLiteral("start")).isString()
+            || !event.value(QStringLiteral("end")).isString()) {
+            *errorCode = QStringLiteral("INVALID_EVENT_CHANGES");
+            *error = QStringLiteral("event change requires a stable UID and string start/end values");
+            return false;
+        }
+        if (!calendarIndex.contains(calendarId)) {
+            *errorCode = QStringLiteral("FULL_SNAPSHOT_REQUIRED");
+            *error = QStringLiteral("calendar '%1' is not present in the cached snapshot; send a full snapshot to synchronise calendar metadata").arg(calendarId);
+            return false;
+        }
+        // Last observer state wins for a UID. The host compares it to the
+        // snapshot's authoritative state to decide add/modify/remove.
+        changesByCalendar[calendarId].insert(uid, change);
+    }
+    timings->validationMs = validationTimer.nsecsElapsed() / 1000000.0;
+
+    QElapsedTimer diffTimer;
+    diffTimer.start();
+    QJsonArray deltas;
+    for (auto calendarIt = changesByCalendar.cbegin(); calendarIt != changesByCalendar.cend(); ++calendarIt) {
+        const QString calendarId = calendarIt.key();
+        const int index = calendarIndex.value(calendarId);
+        QJsonObject calendar = calendars.at(index).toObject();
+        const QJsonArray oldEvents = calendar.value(QStringLiteral("events")).toArray();
+        QHash<QString, QJsonObject> eventMap;
+        QStringList eventOrder;
+        eventMap.reserve(oldEvents.size() + calendarIt.value().size());
+        eventOrder.reserve(oldEvents.size() + calendarIt.value().size());
+        for (const QJsonValue &eventValue : oldEvents) {
+            const QJsonObject event = eventValue.toObject();
+            const QString uid = event.value(QStringLiteral("uid")).toString();
+            if (uid.isEmpty()) {
+                continue;
+            }
+            if (!eventMap.contains(uid)) {
+                eventOrder.append(uid);
+            }
+            eventMap.insert(uid, event);
+        }
+
+        for (auto changeIt = calendarIt.value().cbegin(); changeIt != calendarIt.value().cend(); ++changeIt) {
+            const QString uid = changeIt.key();
+            const QJsonObject change = changeIt.value();
+            const QString operation = change.value(QStringLiteral("operation")).toString();
+            const QJsonObject event = change.value(QStringLiteral("event")).toObject();
+            const auto oldIt = eventMap.constFind(uid);
+            const bool exists = oldIt != eventMap.cend();
+
+            if (operation == QStringLiteral("remove")) {
+                if (exists) {
+                    deltas.append(QJsonObject{
+                        {QStringLiteral("operation"), QStringLiteral("remove")},
+                        {QStringLiteral("calendarId"), calendarId},
+                        {QStringLiteral("event"), oldIt.value()},
+                    });
+                    eventMap.remove(uid);
+                }
+                continue;
+            }
+
+            if (!exists) {
+                eventMap.insert(uid, event);
+                eventOrder.append(uid);
+                deltas.append(QJsonObject{
+                    {QStringLiteral("operation"), QStringLiteral("add")},
+                    {QStringLiteral("calendarId"), calendarId},
+                    {QStringLiteral("event"), event},
+                });
+            } else if (oldIt.value() != event) {
+                deltas.append(QJsonObject{
+                    {QStringLiteral("operation"), QStringLiteral("modify")},
+                    {QStringLiteral("calendarId"), calendarId},
+                    {QStringLiteral("previous"), oldIt.value()},
+                    {QStringLiteral("event"), event},
+                });
+                eventMap.insert(uid, event);
+            }
+        }
+
+        QJsonArray updatedEvents;
+        for (const QString &uid : std::as_const(eventOrder)) {
+            const auto it = eventMap.constFind(uid);
+            if (it != eventMap.cend()) {
+                updatedEvents.append(it.value());
+            }
+        }
+        if (updatedEvents.size() > MaxEventsPerCalendar) {
+            *errorCode = QStringLiteral("EVENT_LIMIT_EXCEEDED");
+            *error = QStringLiteral("calendar '%1' would contain %2 events; host limit is %3 per calendar")
+                .arg(calendarId).arg(updatedEvents.size()).arg(MaxEventsPerCalendar);
+            return false;
+        }
+        calendar.insert(QStringLiteral("events"), updatedEvents);
+        calendars.replace(index, calendar);
+    }
+    timings->eventDiffMs = diffTimer.nsecsElapsed() / 1000000.0;
+
+    if (deltas.isEmpty()) {
+        timings->unchanged = true;
+        timings->eventDeltaCount = 0;
+        return true;
+    }
+
+    timings->eventDeltaCount = deltas.size();
+    QJsonObject updatedSnapshot = cachedSnapshot;
+    updatedSnapshot.insert(QStringLiteral("calendars"), calendars);
+    updatedSnapshot.insert(QStringLiteral("generatedAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
+
+    phase.restart();
+    const QByteArray digest = contentDigest(updatedSnapshot);
+    timings->contentHashMs = phase.nsecsElapsed() / 1000000.0;
+    const QString previousRevision = cachedSnapshot.value(QStringLiteral("contentRevision")).toString().isEmpty()
+        ? QString::fromLatin1(lastWrittenDigest.toHex())
+        : cachedSnapshot.value(QStringLiteral("contentRevision")).toString();
+    const QString revision = QString::fromLatin1(digest.toHex());
+    timings->revision = revision;
+    updatedSnapshot.insert(QStringLiteral("contentRevision"), revision);
+
+    phase.restart();
+    const QByteArray data = QJsonDocument(updatedSnapshot).toJson(QJsonDocument::Compact);
+    timings->snapshotSerializationMs = phase.nsecsElapsed() / 1000000.0;
+    timings->cacheWriteBytes = data.size();
+
+    phase.restart();
+    QSaveFile file(cachePath);
+    if (!file.open(QIODevice::WriteOnly)) {
+        *errorCode = QStringLiteral("CACHE_WRITE_ERROR");
+        *error = QStringLiteral("could not open cache file for direct event update: %1").arg(file.errorString());
+        timings->diskCommitMs = phase.nsecsElapsed() / 1000000.0;
+        return false;
+    }
+    const auto privateFile = QFileDevice::ReadOwner | QFileDevice::WriteOwner;
+    if (!file.setPermissions(privateFile)) {
+        *errorCode = QStringLiteral("CACHE_PERMISSION_ERROR");
+        *error = QStringLiteral("could not restrict cache file permissions: %1").arg(cachePath);
+        file.cancelWriting();
+        timings->diskCommitMs = phase.nsecsElapsed() / 1000000.0;
+        return false;
+    }
+    if (file.write(data) != data.size() || !file.commit()) {
+        *errorCode = QStringLiteral("CACHE_WRITE_ERROR");
+        *error = QStringLiteral("could not commit direct event update: %1").arg(file.errorString());
+        timings->diskCommitMs = phase.nsecsElapsed() / 1000000.0;
+        return false;
+    }
+    timings->diskCommitMs = phase.nsecsElapsed() / 1000000.0;
+    lastWrittenDigest = digest;
+    cachedSnapshot = updatedSnapshot;
+    hasCachedSnapshot = true;
+
+    phase.restart();
+    notifyEventDeltas(deltas, previousRevision, revision);
     timings->dbusNotifyMs = phase.nsecsElapsed() / 1000000.0;
     return true;
 }
@@ -348,6 +799,12 @@ QJsonObject makeResponse(bool ok,
     }
     if (!requestId.isUndefined() && !requestId.isNull()) {
         response.insert(QStringLiteral("requestId"), requestId);
+    }
+    if (ok && timings && timings->eventDeltaCount > 0) {
+        response.insert(QStringLiteral("appliedChanges"), static_cast<double>(timings->eventDeltaCount));
+    }
+    if (ok && timings && !timings->revision.isEmpty()) {
+        response.insert(QStringLiteral("revision"), timings->revision);
     }
     if (includeTimings && timings) {
         response.insert(QStringLiteral("hostTimingsMs"), timings->toJson());
@@ -467,7 +924,16 @@ int main(int argc, char **argv)
         const QJsonValue requestId = request.value(QStringLiteral("requestId"));
         QString error;
         QString errorCode;
-        const bool ok = acceptSnapshot(request, &error, &errorCode, &timings);
+        const QString messageType = request.value(QStringLiteral("type")).toString();
+        const bool ok = messageType == QStringLiteral("snapshot")
+            ? acceptSnapshot(request, &error, &errorCode, &timings)
+            : messageType == QStringLiteral("eventChanges")
+                ? acceptEventChanges(request, &error, &errorCode, &timings)
+                : false;
+        if (messageType != QStringLiteral("snapshot") && messageType != QStringLiteral("eventChanges")) {
+            errorCode = QStringLiteral("INVALID_MESSAGE_TYPE");
+            error = QStringLiteral("supported message types are snapshot and eventChanges");
+        }
         timings.hostProcessingMs = processingTimer.nsecsElapsed() / 1000000.0;
         QJsonObject response = makeResponse(ok, error, errorCode, requestId, &timings, includeTimings);
 

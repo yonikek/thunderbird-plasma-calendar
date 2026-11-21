@@ -13,6 +13,10 @@ const SNAPSHOT_RETRY_BASE_MS = 5 * 1000;
 const SNAPSHOT_RETRY_MAX_MS = 5 * 60 * 1000;
 const NATIVE_ACK_TIMEOUT_MS = 60 * 1000;
 const MAX_NATIVE_MESSAGE_BYTES = 32 * 1024 * 1024;
+const ITEM_CHANGE_DEBOUNCE_MS = 120;
+const MAX_QUEUED_ITEM_CHANGES = 5000;
+const MAX_ITEM_CHANGES_PER_MESSAGE = 1000;
+const ITEM_CHANGE_RETRY_MS = 1500;
 
 let nativePort = null;
 let refreshInProgress = false;
@@ -27,6 +31,10 @@ let snapshotRetryDelayMs = SNAPSHOT_RETRY_BASE_MS;
 let debugLogsEnabled = false;
 let nextRequestId = 1;
 const pendingAcks = new Map();
+const pendingItemChanges = new Map();
+let itemChangeFlushTimer = null;
+let itemChangeRetryTimer = null;
+let itemChangeFlushInProgress = false;
 
 function debugLog(level, ...args) {
   if (debugLogsEnabled) {
@@ -69,29 +77,29 @@ function formatMiB(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MiB`;
 }
 
-function sendSnapshotAndWait(snapshot) {
+function sendNativeMessageAndWait(message) {
   if (!nativePort) {
     return Promise.reject(new Error("native host is not connected"));
   }
 
   const requestId = String(nextRequestId++);
-  const message = {
-    type: "snapshot",
+  const completeMessage = {
+    ...message,
     requestId,
-    debugLogs: debugLogsEnabled,
-    snapshot
+    debugLogs: debugLogsEnabled
   };
   // Native messaging uses UTF-8 JSON frames. Measure the complete envelope,
   // including request metadata, before handing it to the browser's native host.
-  const bytes = new TextEncoder().encode(JSON.stringify(message)).byteLength;
+  const bytes = new TextEncoder().encode(JSON.stringify(completeMessage)).byteLength;
   if (bytes > MAX_NATIVE_MESSAGE_BYTES) {
+    const subject = completeMessage.type === "snapshot" ? "Calendar snapshot" : "Calendar event update";
     const error = new Error(
-      `Calendar snapshot is too large for the native-messaging limit: ${formatMiB(bytes)} ` +
+      `${subject} is too large for the native-messaging limit: ${formatMiB(bytes)} ` +
       `(${bytes.toLocaleString()} bytes; maximum ${formatMiB(MAX_NATIVE_MESSAGE_BYTES)}, ` +
       `${MAX_NATIVE_MESSAGE_BYTES.toLocaleString()} bytes). Reduce the look-back/look-ahead range, ` +
       `disable description/location export, or enable text truncation.`
     );
-    error.name = "SnapshotTooLargeError";
+    error.name = "NativeMessageTooLargeError";
     error.code = "NATIVE_MESSAGE_TOO_LARGE";
     error.actualBytes = bytes;
     error.maxBytes = MAX_NATIVE_MESSAGE_BYTES;
@@ -101,15 +109,15 @@ function sendSnapshotAndWait(snapshot) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       pendingAcks.delete(requestId);
-      reject(new Error(`native host did not acknowledge snapshot ${requestId} within ${NATIVE_ACK_TIMEOUT_MS} ms`));
+      reject(new Error(`native host did not acknowledge ${completeMessage.type} ${requestId} within ${NATIVE_ACK_TIMEOUT_MS} ms`));
       // A timed-out host may be stuck processing an earlier frame. Restart it
-      // rather than queueing more snapshots behind an unknown operation.
+      // rather than queueing more messages behind an unknown operation.
       disconnectNativePort();
     }, NATIVE_ACK_TIMEOUT_MS);
-    pendingAcks.set(requestId, { resolve, reject, timer, bytes });
+    pendingAcks.set(requestId, { resolve, reject, timer, bytes, type: completeMessage.type });
 
     try {
-      nativePort.postMessage(message);
+      nativePort.postMessage(completeMessage);
     } catch (error) {
       clearTimeout(timer);
       pendingAcks.delete(requestId);
@@ -118,11 +126,119 @@ function sendSnapshotAndWait(snapshot) {
   });
 }
 
+function sendSnapshotAndWait(snapshot) {
+  return sendNativeMessageAndWait({ type: "snapshot", snapshot });
+}
+
+function eventChangeKey(change) {
+  return `${String(change.calendarId)}\u0000${String(change.event.uid)}`;
+}
+
+function scheduleItemChangeFlush(delay = ITEM_CHANGE_DEBOUNCE_MS) {
+  if (itemChangeFlushTimer !== null || itemChangeRetryTimer !== null || pendingItemChanges.size === 0) {
+    return;
+  }
+  itemChangeFlushTimer = setTimeout(() => {
+    itemChangeFlushTimer = null;
+    flushItemChanges();
+  }, delay);
+}
+
+function queueItemChanges(changes) {
+  if (!Array.isArray(changes) || changes.length === 0) {
+    return;
+  }
+  for (const change of changes) {
+    if (!change || !["add", "modify", "remove"].includes(change.operation)
+        || typeof change.calendarId !== "string"
+        || !change.event || typeof change.event.uid !== "string" || !change.event.uid) {
+      debugLog("warn", "ignored malformed direct calendar item change:", change);
+      continue;
+    }
+    // Keep the final desired state for each calendar/UID during the short
+    // debounce window. The host resolves add-vs-modify against its own snapshot.
+    pendingItemChanges.set(eventChangeKey(change), change);
+  }
+
+  if (pendingItemChanges.size > MAX_QUEUED_ITEM_CHANGES) {
+    pendingItemChanges.clear();
+    fullRefreshNext = true;
+    debugLog("warn", "direct item-change queue exceeded its safety limit; falling back to a full snapshot");
+    requestRefresh();
+    return;
+  }
+  scheduleItemChangeFlush();
+}
+
+async function flushItemChanges() {
+  if (!nativePort || pendingItemChanges.size === 0 || itemChangeFlushInProgress) {
+    return;
+  }
+  if (refreshInProgress) {
+    return; // refreshCalendarCache() schedules this again in its finally block.
+  }
+
+  itemChangeFlushInProgress = true;
+  const batchEntries = Array.from(pendingItemChanges.entries()).slice(0, MAX_ITEM_CHANGES_PER_MESSAGE);
+  for (const [key] of batchEntries) {
+    pendingItemChanges.delete(key);
+  }
+  const changes = batchEntries.map(([, change]) => change);
+
+  try {
+    const response = await sendNativeMessageAndWait({ type: "eventChanges", changes });
+    if (debugLogsEnabled) {
+      debugLog("log", `sent ${changes.length} direct item changes; host applied ${Number(response.appliedChanges || 0)}; revision ${response.revision || "unchanged"}`);
+    }
+    reconnectDelayMs = RECONNECT_BASE_MS;
+  } catch (error) {
+    if (error && error.code === "FULL_SNAPSHOT_REQUIRED") {
+      // The host cache was lost or no longer contains one of the referenced
+      // calendars. A full read re-establishes the authoritative base state.
+      pendingItemChanges.clear();
+      fullRefreshNext = true;
+      debugLog("warn", "native host requested a full snapshot; rebuilding its calendar cache");
+      requestRefresh();
+    } else {
+      // Restore failed changes without overwriting newer changes that arrived
+      // while this request was in flight.
+      for (const [key, change] of batchEntries) {
+        if (!pendingItemChanges.has(key)) {
+          pendingItemChanges.set(key, change);
+        }
+      }
+      if (error && error.code === "NATIVE_MESSAGE_TOO_LARGE") {
+        console.error("Thunderbird Plasma Calendar:", error.message || error);
+        pendingItemChanges.clear();
+        fullRefreshNext = true;
+        requestRefresh();
+      } else {
+        debugLog("error", "direct calendar update failed; will retry:", error);
+        if (itemChangeRetryTimer === null) {
+          itemChangeRetryTimer = setTimeout(() => {
+            itemChangeRetryTimer = null;
+            scheduleItemChangeFlush(0);
+          }, ITEM_CHANGE_RETRY_MS);
+        }
+      }
+    }
+  } finally {
+    itemChangeFlushInProgress = false;
+    if (pendingItemChanges.size > 0 && itemChangeRetryTimer === null) {
+      scheduleItemChangeFlush(0);
+    }
+    if (refreshQueued) {
+      refreshQueued = false;
+      requestRefresh();
+    }
+  }
+}
+
 async function refreshCalendarCache() {
   if (!nativePort) {
     return;
   }
-  if (refreshInProgress) {
+  if (refreshInProgress || itemChangeFlushInProgress) {
     refreshQueued = true;
     return;
   }
@@ -179,6 +295,9 @@ async function refreshCalendarCache() {
     }
   } finally {
     refreshInProgress = false;
+    if (pendingItemChanges.size > 0) {
+      scheduleItemChangeFlush(0);
+    }
     if (refreshQueued) {
       refreshQueued = false;
       requestRefresh();
@@ -210,6 +329,7 @@ function logTiming(snapshot, started, readFinished, acknowledged, delivery) {
         "wait before message " + phase("messageWaitMs") + ", frame read " + phase("frameReadMs") +
         ", JSON parse " + phase("jsonParseMs") +
         ", validation " + phase("validationMs") + ", content hash " + phase("contentHashMs") +
+        ", event diff " + phase("eventDiffMs") + " (" + Number(phases.eventDeltaCount || 0) + " event changes)" +
         ", cache directory " + phase("cacheDirectoryMs") +
         ", existing cache read " + phase("existingCacheReadMs") +
         ", cache preparation total " + phase("cachePreparationMs") +
@@ -304,7 +424,7 @@ function handleNativeMessage(message) {
       clientPayloadBytes: pending.bytes
     });
   } else {
-    const error = new Error(message.error || "native host rejected the snapshot");
+    const error = new Error(message.error || `native host rejected ${pending.type || "message"}`);
     if (typeof message.code === "string") {
       error.code = message.code;
     }
@@ -339,6 +459,7 @@ function connectNativeHost() {
 }
 
 browser.tbCalendarBridge.onChanged.addListener(requestRefresh);
+browser.tbCalendarBridge.onItemChanges.addListener(queueItemChanges);
 browser.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") {
     return;

@@ -40,6 +40,7 @@ const browser = {
   storage: { onChanged: { addListener() {} } },
   tbCalendarBridge: {
     onChanged: { addListener() {} },
+    onItemChanges: { addListener() {} },
     setDebugLogging() {},
     async getSnapshot(start, end) {
       return {

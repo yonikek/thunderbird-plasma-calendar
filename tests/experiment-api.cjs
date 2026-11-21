@@ -16,10 +16,12 @@ function dt(value) {
   const result = new Date(value);
   result.isDate = false;
   result.getInTimezone = () => result;
+  result.clone = () => dt(value);
+  result.compare = other => result.getTime() - other.getTime();
   return result;
 }
 const event = {
-  id: 'evt-1', title: 'Test event', isTodo: false,
+  id: 'evt-1', title: 'Test event', isTodo: false, recurrenceInfo: null,
   startDate: dt('2026-11-20T10:00:00Z'),
   endDate: dt('2026-11-20T11:00:00Z'),
   descriptionText: 'abcdefghijk',
@@ -48,6 +50,7 @@ function makeCalendar(id, delayMs = 10) {
   };
 }
 const calendar = makeCalendar('calendar-1');
+event.calendar = calendar;
 const manager = {
   getCalendars: () => [calendar],
   addCalendarObserver(observer) { observers.calendar = observer; },
@@ -68,7 +71,7 @@ class ExtensionAPI {}
 class EventManager {
   constructor({ register }) { this.register = register; }
   api() {
-    return { addListener: listener => this.register({ async: () => listener() }) };
+    return { addListener: listener => this.register({ async: (...args) => listener(...args) }) };
   }
 }
 const ExtensionCommon = { ExtensionAPI, EventManager };
@@ -146,15 +149,105 @@ const api = new ApiClass().getAPI({}).tbCalendarBridge;
   if (newInstallDefaults.calendars[0].events[0].description !== 'abcde…') throw new Error('description truncation should default to enabled');
   if (newInstallDefaults.calendars[0].events[0].location !== 'Somewhere') throw new Error('location truncation should default to disabled');
 
-  // Batch notifications are coalesced into one extension event.
-  let changeEvents = 0;
-  api.onChanged.addListener(() => { changeEvents++; });
+  // Restore the event's test range before exercising live notifications.
+  await api.getSnapshot(start, end, { ...options, enableDebugLogs: false, useCache: false });
+
+  // Item observers produce direct serialized changes without requesting a full snapshot.
+  const directChanges = [];
+  let fallbackRefreshes = 0;
+  api.onChanged.addListener(() => { fallbackRefreshes++; });
+  api.onItemChanges.addListener(changes => directChanges.push(changes));
+  observers.calendar.onAddItem(event);
+  if (directChanges.length !== 1 || directChanges[0][0].operation !== 'add') {
+    throw new Error('onAddItem did not emit a direct add change');
+  }
+  const oldEvent = {
+    ...event,
+    title: 'Old title',
+    startDate: dt('2026-11-20T10:00:00Z'),
+    endDate: dt('2026-11-20T11:00:00Z'),
+    calendar
+  };
+  event.title = 'Updated title';
+  observers.calendar.onModifyItem(event, oldEvent);
+  if (directChanges[1]?.[0]?.operation !== 'modify'
+      || directChanges[1][0].event.title !== 'Updated title') {
+    throw new Error('onModifyItem did not emit a direct modify change');
+  }
+  const movedOldEvent = {
+    ...event,
+    startDate: dt('2026-11-20T10:00:00Z'),
+    endDate: dt('2026-11-20T11:00:00Z'),
+    calendar
+  };
+  const movedNewEvent = {
+    ...event,
+    startDate: dt('2026-11-21T10:00:00Z'),
+    endDate: dt('2026-11-21T11:00:00Z'),
+    calendar
+  };
+  observers.calendar.onModifyItem(movedNewEvent, movedOldEvent);
+  if (directChanges[2]?.[0]?.operation !== 'modify'
+      || directChanges[2][0].event.start !== '2026-11-21T10:00:00.000Z') {
+    throw new Error('date move was not forwarded as a direct modification with the new start date');
+  }
+  observers.calendar.onDeleteItem(event);
+  if (directChanges[3]?.[0]?.operation !== 'remove') {
+    throw new Error('onDeleteItem did not emit a direct remove change');
+  }
+
+  // A recurrence exception is already one concrete occurrence; direct observer
+  // serialization must still exclude it when it lies outside the exported range.
+  const outsideOccurrence = {
+    ...event,
+    id: 'evt-recurring',
+    recurrenceId: { icalString: '20261220T100000Z' },
+    startDate: dt('2026-12-20T10:00:00Z'),
+    endDate: dt('2026-12-20T11:00:00Z'),
+    calendar
+  };
+  const changesBeforeOutsideOccurrence = directChanges.length;
+  observers.calendar.onAddItem(outsideOccurrence);
+  if (directChanges.length !== changesBeforeOutsideOccurrence) {
+    throw new Error('out-of-range recurrence occurrence leaked into direct changes');
+  }
+  const inRangeOccurrence = {
+    ...event,
+    id: 'evt-recurring',
+    recurrenceId: { icalString: '20261120T100000Z' },
+    startDate: dt('2026-11-20T10:00:00Z'),
+    endDate: dt('2026-11-20T11:00:00Z'),
+    calendar
+  };
+  observers.calendar.onAddItem(inRangeOccurrence);
+  if (directChanges.length !== changesBeforeOutsideOccurrence + 1
+      || directChanges.at(-1)?.[0]?.event?.uid !== 'calendar-1:evt-recurring:20261120T100000Z') {
+    throw new Error('in-range recurrence occurrence was not represented as one direct item change');
+  }
+  const recurringMaster = {
+    ...event,
+    id: 'evt-series',
+    recurrenceInfo: {
+      getOccurrences() { return [inRangeOccurrence]; }
+    },
+    calendar
+  };
+  observers.calendar.onAddItem(recurringMaster);
+  if (directChanges.at(-1)?.[0]?.event?.uid !== 'calendar-1:evt-recurring:20261120T100000Z') {
+    throw new Error('recurring master was not expanded into its in-range occurrence');
+  }
+
+  // Batch notifications are coalesced into one direct extension event, not a full refresh.
+  directChanges.length = 0;
   observers.calendar.onStartBatch(calendar);
   observers.calendar.onAddItem(event);
-  observers.calendar.onModifyItem(event);
+  observers.calendar.onModifyItem(event, oldEvent);
   observers.calendar.onDeleteItem(event);
   observers.calendar.onEndBatch(calendar);
-  if (changeEvents !== 1) throw new Error(`batch emitted ${changeEvents} change notifications instead of one`);
+  if (directChanges.length !== 1 || directChanges[0].length !== 3) {
+    throw new Error(`batch emitted ${directChanges.length} direct notifications containing ${directChanges[0]?.length || 0} changes`);
+  }
+  if (fallbackRefreshes !== 0) throw new Error('ordinary item changes unexpectedly requested a full calendar refresh');
 
   // Five calendars are used to verify that at most three providers are active.
   manager.getCalendars = () => [
@@ -174,7 +267,7 @@ const api = new ApiClass().getAPI({}).tbCalendarBridge;
   if (timedOut.calendars[0].status !== 'error') throw new Error('timed-out calendar did not report an error state');
   if (timeoutElapsed < 4900 || timeoutElapsed > 9000) throw new Error(`query timeout duration unexpected: ${timeoutElapsed} ms`);
 
-  console.log('Experiment API mock tests passed: independent truncation, last-good fallback, debug gating, batch coalescing, concurrency <= 3, query timeout.');
+  console.log('Experiment API mock tests passed: independent truncation, last-good fallback, debug gating, direct add/modify/move/remove notifications, batch coalescing, concurrency <= 3, query timeout.');
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;

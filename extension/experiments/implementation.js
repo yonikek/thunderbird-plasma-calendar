@@ -18,9 +18,13 @@ var tbCalendarBridge = (() => {
   const CHUNK_DAYS = 30;
   const MAX_CONCURRENT_CALENDARS = 3;
   const DEFAULT_QUERY_TIMEOUT_SECONDS = 60;
+  const MAX_OBSERVER_OCCURRENCES = 100000;
+  const MAX_BATCHED_OBSERVER_CHANGES = 5000;
+  const RECENT_ITEM_LOAD_SUPPRESSION_MS = 5000;
   const WATCHED_PROPERTIES = new Set(["name", "color", "disabled"]);
 
   let debugLogsEnabled = false;
+  let liveObserverConfig = null;
 
   function debugError(...args) {
     if (debugLogsEnabled) {
@@ -268,12 +272,154 @@ var tbCalendarBridge = (() => {
     }
   }
 
-  function createObservers(notify, invalidateCalendar) {
+  function cloneDateTime(value) {
+    return value && typeof value.clone === "function" ? value.clone() : value;
+  }
+
+  function itemOverlapsLiveRange(item) {
+    if (!item || !liveObserverConfig) {
+      return false;
+    }
+    const isTodo = typeof item.isTodo === "function" ? item.isTodo() : Boolean(item.isTodo);
+    const { start, end } = itemDateTimes(item, isTodo);
+    // Match getItems() range semantics: include an event if it overlaps the
+    // requested interval, even when a multi-day event began before rangeStart.
+    return Boolean(start && end
+      && start.compare(liveObserverConfig.rangeEnd) < 0
+      && end.compare(liveObserverConfig.rangeStart) > 0);
+  }
+
+  // Observer notifications carry the changed item, unlike onChanged which
+  // merely invalidates a calendar cache. Recurring masters must be expanded
+  // into the same occurrence objects getItems(ITEM_FILTER_CLASS_OCCURRENCES)
+  // returns for the currently exported range.
+  function observerOccurrences(item) {
+    if (!item || !liveObserverConfig) {
+      return null;
+    }
+    // A recurrence occurrence/exception already identifies one instance by
+    // recurrenceId (and points back to its master through parentItem). Expanding
+    // its parent's recurrenceInfo would turn one edited occurrence into changes
+    // for the entire series.
+    if (item.recurrenceId || (item.parentItem && item.parentItem !== item)) {
+      return itemOverlapsLiveRange(item) ? [item] : [];
+    }
+    const recurrenceInfo = item.recurrenceInfo;
+    if (recurrenceInfo) {
+      const occurrences = recurrenceInfo.getOccurrences(
+        cloneDateTime(liveObserverConfig.rangeStart),
+        cloneDateTime(liveObserverConfig.rangeEnd),
+        MAX_OBSERVER_OCCURRENCES
+      );
+      // Reaching the cap may mean the observer change represents more
+      // instances than this direct protocol can safely enqueue. Fall back to
+      // the normal full-snapshot path rather than silently omitting instances.
+      if (occurrences.length >= MAX_OBSERVER_OCCURRENCES) {
+        return null;
+      }
+      return occurrences.filter(itemOverlapsLiveRange);
+    }
+    return itemOverlapsLiveRange(item) ? [item] : [];
+  }
+
+  function serializeObservedItems(item) {
+    if (!item || !liveObserverConfig) {
+      return null;
+    }
+    const calendar = itemCalendar(item);
+    const calendarId = calendarIdOf(calendar);
+    if (calendarId === null) {
+      return null;
+    }
+    try {
+      if (calendar.getProperty("disabled") === true) {
+        return [];
+      }
+    } catch (error) {
+      // A provider may not expose the disabled property; treat it as enabled.
+    }
+
+    const occurrences = observerOccurrences(item);
+    if (!Array.isArray(occurrences)) {
+      return null;
+    }
+    const color = calendarColour(calendar);
+    const result = [];
+    for (const occurrence of occurrences) {
+      const recurrence = recurrenceString(occurrence);
+      const serialized = serializeItem(
+        occurrence, calendarId, color, liveObserverConfig.options, recurrence
+      );
+      if (serialized) {
+        result.push({ calendarId, event: serialized });
+      }
+    }
+    return result;
+  }
+
+  function observerChangeList(operation, newItem, oldItem) {
+    if (!liveObserverConfig) {
+      return null;
+    }
+    if (operation === "add") {
+      const current = serializeObservedItems(newItem);
+      return current === null ? null : current.map(value => ({ operation: "add", ...value }));
+    }
+    if (operation === "remove") {
+      const previous = serializeObservedItems(oldItem);
+      return previous === null ? null : previous.map(value => ({ operation: "remove", ...value }));
+    }
+
+    const previous = serializeObservedItems(oldItem);
+    const current = serializeObservedItems(newItem);
+    if (previous === null || current === null) {
+      return null;
+    }
+    const previousByKey = new Map(previous.map(value => [`${value.calendarId}\u0000${value.event.uid}`, value]));
+    const currentByKey = new Map(current.map(value => [`${value.calendarId}\u0000${value.event.uid}`, value]));
+    const changes = [];
+    for (const [key, oldValue] of previousByKey) {
+      const newValue = currentByKey.get(key);
+      if (!newValue) {
+        changes.push({ operation: "remove", ...oldValue });
+      } else {
+        currentByKey.delete(key);
+        if (JSON.stringify(oldValue.event) !== JSON.stringify(newValue.event)) {
+          changes.push({ operation: "modify", ...newValue });
+        }
+      }
+    }
+    for (const value of currentByKey.values()) {
+      changes.push({ operation: "add", ...value });
+    }
+    return changes;
+  }
+
+  function createObservers(notify, invalidateCalendar, notifyItemChanges) {
     const watched = name => WATCHED_PROPERTIES.has(String(name).toLowerCase());
     let batchDepth = 0;
-    let batchDirty = false;
+    let batchNeedsRefresh = false;
+    let batchHadItemChanges = false;
+    let batchOverflow = false;
+    const batchChanges = [];
     const batchInvalidated = new Set();
+    const batchCalendarIds = new Set();
+    const recentItemLoads = new Map();
     let batchGlobalInvalidated = false;
+
+    const markRecentItemChange = calendar => {
+      const id = calendarIdOf(calendar);
+      if (id === null) {
+        return;
+      }
+      const expiry = Date.now() + RECENT_ITEM_LOAD_SUPPRESSION_MS;
+      recentItemLoads.set(id, expiry);
+      setTimeout(() => {
+        if (recentItemLoads.get(id) === expiry) {
+          recentItemLoads.delete(id);
+        }
+      }, RECENT_ITEM_LOAD_SUPPRESSION_MS);
+    };
 
     const invalidateDuringBatch = calendar => {
       const id = calendarIdOf(calendar);
@@ -285,12 +431,13 @@ var tbCalendarBridge = (() => {
       } else if (!batchInvalidated.has(id)) {
         invalidateCalendar(calendar);
         batchInvalidated.add(id);
+        batchCalendarIds.add(id);
       }
     };
 
     const changed = calendar => {
       if (batchDepth > 0) {
-        batchDirty = true;
+        batchNeedsRefresh = true;
         invalidateDuringBatch(calendar);
         return;
       }
@@ -298,11 +445,55 @@ var tbCalendarBridge = (() => {
       notify();
     };
 
+    const itemChanged = (operation, newItem, oldItem) => {
+      const calendar = itemCalendar(newItem || oldItem);
+      const calendarId = calendarIdOf(calendar);
+      if (batchDepth > 0) {
+        invalidateDuringBatch(calendar);
+      } else {
+        invalidateCalendar(calendar);
+      }
+
+      let changes;
+      try {
+        changes = observerChangeList(operation, newItem, oldItem);
+      } catch (error) {
+        debugError("could not serialise observed calendar change; scheduling a snapshot refresh:", error);
+        changes = null;
+      }
+      if (changes === null) {
+        if (batchDepth > 0) {
+          batchNeedsRefresh = true;
+        } else {
+          notify();
+        }
+        return;
+      }
+      if (changes.length === 0) {
+        return;
+      }
+      markRecentItemChange(calendar);
+      if (batchDepth > 0) {
+        batchHadItemChanges = true;
+        if (!batchOverflow) {
+          batchChanges.push(...changes);
+          if (batchChanges.length > MAX_BATCHED_OBSERVER_CHANGES) {
+            batchChanges.length = 0;
+            batchOverflow = true;
+            batchNeedsRefresh = true;
+            debugInfo("calendar batch exceeded the direct-update limit; falling back to a snapshot refresh",
+              calendarId || "unknown calendar");
+          }
+        }
+      } else {
+        notifyItemChanges(changes);
+      }
+    };
+
     const calendarObserver = {
       QueryInterface: ChromeUtils.generateQI(["calIObserver"]),
       onStartBatch(calendar) {
         batchDepth++;
-        batchDirty = true;
         invalidateDuringBatch(calendar);
       },
       onEndBatch(calendar) {
@@ -312,20 +503,37 @@ var tbCalendarBridge = (() => {
         }
         batchDepth--;
         if (batchDepth === 0) {
-          if (batchDirty) {
+          if (batchHadItemChanges && !batchOverflow && batchChanges.length > 0) {
+            notifyItemChanges(batchChanges.splice(0));
+          }
+          if (batchNeedsRefresh || batchOverflow) {
             notify();
           }
-          batchDirty = false;
+          for (const id of batchCalendarIds) {
+            markRecentItemChange({ id });
+          }
+          batchNeedsRefresh = false;
+          batchHadItemChanges = false;
+          batchOverflow = false;
+          batchChanges.length = 0;
           batchInvalidated.clear();
+          batchCalendarIds.clear();
           batchGlobalInvalidated = false;
-        } else {
-          batchDirty = true;
         }
       },
-      onLoad(calendar) { changed(calendar); },
-      onAddItem(item) { changed(itemCalendar(item)); },
-      onModifyItem(newItem) { changed(itemCalendar(newItem)); },
-      onDeleteItem(item) { changed(itemCalendar(item)); },
+      onLoad(calendar) {
+        const id = calendarIdOf(calendar);
+        const expiry = id === null ? 0 : (recentItemLoads.get(id) || 0);
+        if (expiry > Date.now()) {
+          recentItemLoads.delete(id);
+          debugInfo("ignored redundant onLoad following direct item notifications", id);
+          return;
+        }
+        changed(calendar);
+      },
+      onAddItem(item) { itemChanged("add", item, null); },
+      onModifyItem(newItem, oldItem) { itemChanged("modify", newItem, oldItem); },
+      onDeleteItem(item) { itemChanged("remove", null, item); },
       onError(calendar, code, message) {
         debugError("calendar provider error", calendarIdOf(calendar) || "unknown calendar", code, message || "");
         changed(calendar);
@@ -352,6 +560,7 @@ var tbCalendarBridge = (() => {
   }
 
   const listeners = new Set();
+  const itemChangeListeners = new Set();
   let tracker = null;
 
   function ensureTracker() {
@@ -362,7 +571,11 @@ var tbCalendarBridge = (() => {
       for (const notify of listeners) {
         notify();
       }
-    }, invalidate);
+    }, invalidate, changes => {
+      for (const notify of itemChangeListeners) {
+        notify(changes);
+      }
+    });
     cal.manager.addCalendarObserver(tracker.calendarObserver);
     cal.manager.addObserver(tracker.managerObserver);
   }
@@ -378,6 +591,8 @@ var tbCalendarBridge = (() => {
       tracker = null;
     }
     listeners.clear();
+    itemChangeListeners.clear();
+    liveObserverConfig = null;
     cache.clear();
     calendarVersions.clear();
     globalVersion++;
@@ -578,6 +793,11 @@ var tbCalendarBridge = (() => {
                 Number(options && options.queryTimeoutSeconds) || DEFAULT_QUERY_TIMEOUT_SECONDS))
             };
             debugLogsEnabled = Boolean(options && options.enableDebugLogs === true);
+            liveObserverConfig = {
+              rangeStart: cal.dtz.jsDateToDateTime(range.start),
+              rangeEnd: cal.dtz.jsDateToDateTime(range.end),
+              options: exportOptions
+            };
             const useCache = !options || options.useCache !== false;
             const timeoutMs = exportOptions.queryTimeoutSeconds * 1000;
             const logTiming = debugLogsEnabled;
@@ -701,6 +921,25 @@ var tbCalendarBridge = (() => {
               ensureTracker();
               listeners.add(notify);
               return () => listeners.delete(notify);
+            }
+          }).api(),
+
+          onItemChanges: new ExtensionCommon.EventManager({
+            context,
+            name: "tbCalendarBridge.onItemChanges",
+            register(fire) {
+              const notify = changes => {
+                try {
+                  if (Array.isArray(changes) && changes.length > 0) {
+                    fire.async(changes);
+                  }
+                } catch (error) {
+                  debugError("direct item-change notification failed:", error);
+                }
+              };
+              ensureTracker();
+              itemChangeListeners.add(notify);
+              return () => itemChangeListeners.delete(notify);
             }
           }).api()
         }

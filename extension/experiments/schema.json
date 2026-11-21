@@ -6,7 +6,10 @@
         "name": "setDebugLogging",
         "type": "function",
         "parameters": [
-          { "name": "enabled", "type": "boolean" }
+          {
+            "name": "enabled",
+            "type": "boolean"
+          }
         ]
       },
       {
@@ -14,23 +17,59 @@
         "type": "function",
         "async": true,
         "parameters": [
-          { "name": "startIso", "type": "string" },
-          { "name": "endIso", "type": "string" },
+          {
+            "name": "startIso",
+            "type": "string"
+          },
+          {
+            "name": "endIso",
+            "type": "string"
+          },
           {
             "name": "options",
             "type": "object",
             "optional": true,
             "properties": {
-              "includeDescriptions": { "type": "boolean", "optional": true },
-              "includeLocations": { "type": "boolean", "optional": true },
-              "truncateDescriptions": { "type": "boolean", "optional": true },
-              "truncateLocations": { "type": "boolean", "optional": true },
-              "truncateText": { "type": "boolean", "optional": true },
-              "maxDescriptionChars": { "type": "integer", "optional": true },
-              "maxLocationChars": { "type": "integer", "optional": true },
-              "queryTimeoutSeconds": { "type": "integer", "optional": true },
-              "enableDebugLogs": { "type": "boolean", "optional": true },
-              "useCache": { "type": "boolean", "optional": true }
+              "includeDescriptions": {
+                "type": "boolean",
+                "optional": true
+              },
+              "includeLocations": {
+                "type": "boolean",
+                "optional": true
+              },
+              "truncateDescriptions": {
+                "type": "boolean",
+                "optional": true
+              },
+              "truncateLocations": {
+                "type": "boolean",
+                "optional": true
+              },
+              "truncateText": {
+                "type": "boolean",
+                "optional": true
+              },
+              "maxDescriptionChars": {
+                "type": "integer",
+                "optional": true
+              },
+              "maxLocationChars": {
+                "type": "integer",
+                "optional": true
+              },
+              "queryTimeoutSeconds": {
+                "type": "integer",
+                "optional": true
+              },
+              "enableDebugLogs": {
+                "type": "boolean",
+                "optional": true
+              },
+              "useCache": {
+                "type": "boolean",
+                "optional": true
+              }
             }
           }
         ]
@@ -42,6 +81,60 @@
         "type": "function",
         "description": "Fires when calendars or calendar items change. May fire in bursts; callers should debounce.",
         "parameters": []
+      },
+      {
+        "name": "onItemChanges",
+        "type": "function",
+        "description": "Fires with serialized additions, modifications and removals from Thunderbird calendar observers.",
+        "parameters": [
+          {
+            "name": "changes",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "string"
+                },
+                "calendarId": {
+                  "type": "string"
+                },
+                "event": {
+                  "type": "object",
+                  "properties": {
+                    "uid": {
+                      "type": "string"
+                    },
+                    "title": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "location": {
+                      "type": "string"
+                    },
+                    "start": {
+                      "type": "string"
+                    },
+                    "end": {
+                      "type": "string"
+                    },
+                    "allDay": {
+                      "type": "boolean"
+                    },
+                    "kind": {
+                      "type": "string"
+                    },
+                    "color": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
       }
     ]
   }
