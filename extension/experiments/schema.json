@@ -23,6 +23,8 @@
             "properties": {
               "includeDescriptions": { "type": "boolean", "optional": true },
               "includeLocations": { "type": "boolean", "optional": true },
+              "truncateDescriptions": { "type": "boolean", "optional": true },
+              "truncateLocations": { "type": "boolean", "optional": true },
               "truncateText": { "type": "boolean", "optional": true },
               "maxDescriptionChars": { "type": "integer", "optional": true },
               "maxLocationChars": { "type": "integer", "optional": true },

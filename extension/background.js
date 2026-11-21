@@ -65,19 +65,36 @@ function disconnectNativePort() {
   }
 }
 
+function formatMiB(bytes) {
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MiB`;
+}
+
 function sendSnapshotAndWait(snapshot) {
   if (!nativePort) {
     return Promise.reject(new Error("native host is not connected"));
   }
 
   const requestId = String(nextRequestId++);
-  const message = { type: "snapshot", requestId, snapshot };
-  // Native messaging uses UTF-8 JSON frames; reject oversized payloads before
-  // sending so that a host-side size error can never lose its request ID.
+  const message = {
+    type: "snapshot",
+    requestId,
+    debugLogs: debugLogsEnabled,
+    snapshot
+  };
+  // Native messaging uses UTF-8 JSON frames. Measure the complete envelope,
+  // including request metadata, before handing it to the browser's native host.
   const bytes = new TextEncoder().encode(JSON.stringify(message)).byteLength;
   if (bytes > MAX_NATIVE_MESSAGE_BYTES) {
-    const error = new Error(`snapshot exceeds the ${MAX_NATIVE_MESSAGE_BYTES} byte native-messaging limit`);
+    const error = new Error(
+      `Calendar snapshot is too large for the native-messaging limit: ${formatMiB(bytes)} ` +
+      `(${bytes.toLocaleString()} bytes; maximum ${formatMiB(MAX_NATIVE_MESSAGE_BYTES)}, ` +
+      `${MAX_NATIVE_MESSAGE_BYTES.toLocaleString()} bytes). Reduce the look-back/look-ahead range, ` +
+      `disable description/location export, or enable text truncation.`
+    );
     error.name = "SnapshotTooLargeError";
+    error.code = "NATIVE_MESSAGE_TOO_LARGE";
+    error.actualBytes = bytes;
+    error.maxBytes = MAX_NATIVE_MESSAGE_BYTES;
     return Promise.reject(error);
   }
 
@@ -89,7 +106,7 @@ function sendSnapshotAndWait(snapshot) {
       // rather than queueing more snapshots behind an unknown operation.
       disconnectNativePort();
     }, NATIVE_ACK_TIMEOUT_MS);
-    pendingAcks.set(requestId, { resolve, reject, timer });
+    pendingAcks.set(requestId, { resolve, reject, timer, bytes });
 
     try {
       nativePort.postMessage(message);
@@ -125,7 +142,8 @@ async function refreshCalendarCache() {
     const snapshot = await browser.tbCalendarBridge.getSnapshot(range.start, range.end, {
       includeDescriptions: settings.exportDescriptions,
       includeLocations: settings.exportLocations,
-      truncateText: settings.truncateText,
+      truncateDescriptions: settings.truncateDescriptions,
+      truncateLocations: settings.truncateLocations,
       maxDescriptionChars: settings.maxDescriptionChars,
       maxLocationChars: settings.maxLocationChars,
       queryTimeoutSeconds: settings.queryTimeoutSeconds,
@@ -134,7 +152,7 @@ async function refreshCalendarCache() {
     });
     snapshotBuilt = true;
     const readFinished = performance.now();
-    await sendSnapshotAndWait(snapshot);
+    const delivery = await sendSnapshotAndWait(snapshot);
     const acknowledged = performance.now();
     if (snapshot.calendars.some(calendar => calendar.retryable === true)) {
       scheduleSnapshotRetry();
@@ -143,14 +161,20 @@ async function refreshCalendarCache() {
     }
 
     if (settings.enableDebugLogs) {
-      logTiming(snapshot, started, readFinished, acknowledged);
+      logTiming(snapshot, started, readFinished, acknowledged, delivery);
     }
   } catch (error) {
     if (requestedFullRefresh && !snapshotBuilt) {
       fullRefreshNext = true;
     }
-    debugLog("error", "calendar refresh/delivery failed:", error);
-    if (error && error.name !== "SnapshotTooLargeError" && !String(error.message || error).includes("snapshot too large")) {
+    if (error && error.code === "NATIVE_MESSAGE_TOO_LARGE") {
+      // This is an actionable delivery failure, not optional diagnostic noise.
+      // Keep it visible even when verbose debug logging is disabled.
+      console.error("Thunderbird Plasma Calendar:", error.message || error);
+    } else {
+      debugLog("error", "calendar refresh/delivery failed:", error);
+    }
+    if (error && error.code !== "NATIVE_MESSAGE_TOO_LARGE" && error.name !== "SnapshotTooLargeError" && !String(error.message || error).includes("snapshot too large")) {
       scheduleSnapshotRetry();
     }
   } finally {
@@ -162,20 +186,43 @@ async function refreshCalendarCache() {
   }
 }
 
-function logTiming(snapshot, started, readFinished, acknowledged) {
+function logTiming(snapshot, started, readFinished, acknowledged, delivery) {
   try {
     let items = 0;
     for (const calendar of snapshot.calendars) {
       items += Array.isArray(calendar.events) ? calendar.events.length : 0;
     }
-    const json = JSON.stringify(snapshot);
-    const kib = (new TextEncoder().encode(json).byteLength / 1024).toFixed(1);
+    const bytes = delivery && Number.isFinite(delivery.clientPayloadBytes)
+      ? delivery.clientPayloadBytes
+      : 0;
     console.log(
       "Thunderbird Plasma Calendar: refresh took " + Math.round(acknowledged - started) +
       " ms (read " + Math.round(readFinished - started) + " ms, native host acknowledgement " +
       Math.round(acknowledged - readFinished) + " ms), " + snapshot.calendars.length +
-      " calendars, " + items + " items, " + kib + " KiB"
+      " calendars, " + items + " items, " + formatMiB(bytes)
     );
+
+    const phases = delivery && delivery.hostTimingsMs;
+    if (phases && typeof phases === "object") {
+      const phase = (name) => Number(phases[name] || 0).toFixed(1);
+      console.log(
+        "Thunderbird Plasma Calendar: native host phases (ms): " +
+        "wait before message " + phase("messageWaitMs") + ", frame read " + phase("frameReadMs") +
+        ", JSON parse " + phase("jsonParseMs") +
+        ", validation " + phase("validationMs") + ", content hash " + phase("contentHashMs") +
+        ", cache directory " + phase("cacheDirectoryMs") +
+        ", existing cache read " + phase("existingCacheReadMs") +
+        ", cache preparation total " + phase("cachePreparationMs") +
+        ", snapshot serialisation " + phase("snapshotSerializationMs") +
+        ", disk commit " + phase("diskCommitMs") + ", D-Bus notification " + phase("dbusNotifyMs") +
+        ", host processing before response write " + phase("hostProcessingMs") +
+        ", remaining round-trip overhead ~" + Math.max(0,
+          (acknowledged - readFinished) - Number(phases.frameReadMs || 0) - Number(phases.hostProcessingMs || 0)
+        ).toFixed(1) + " ms (includes response write; host logs exact total)" +
+        ", cache write " + Number(phases.cacheWriteBytes || 0) + " bytes" +
+        (phases.unchanged === true ? ", cache unchanged" : ", cache updated")
+      );
+    }
   } catch (error) {
     debugLog("warn", "could not log timing:", error);
   }
@@ -252,9 +299,22 @@ function handleNativeMessage(message) {
   pendingAcks.delete(requestId);
   if (message.ok === true) {
     reconnectDelayMs = RECONNECT_BASE_MS;
-    pending.resolve(message);
+    pending.resolve({
+      ...message,
+      clientPayloadBytes: pending.bytes
+    });
   } else {
-    pending.reject(new Error(message.error || "native host rejected the snapshot"));
+    const error = new Error(message.error || "native host rejected the snapshot");
+    if (typeof message.code === "string") {
+      error.code = message.code;
+    }
+    if (Number.isFinite(message.payloadBytes)) {
+      error.actualBytes = message.payloadBytes;
+    }
+    if (Number.isFinite(message.maxBytes)) {
+      error.maxBytes = message.maxBytes;
+    }
+    pending.reject(error);
   }
 }
 

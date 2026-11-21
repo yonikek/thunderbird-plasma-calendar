@@ -104,7 +104,8 @@ const api = new ApiClass().getAPI({}).tbCalendarBridge;
   const end = '2026-11-22T00:00:00.000Z';
   const options = {
     includeDescriptions: true, includeLocations: true,
-    truncateText: true, maxDescriptionChars: 6, maxLocationChars: 5,
+    truncateDescriptions: true, truncateLocations: true,
+    maxDescriptionChars: 6, maxLocationChars: 5,
     queryTimeoutSeconds: 5, enableDebugLogs: false, useCache: true
   };
   const first = await api.getSnapshot(start, end, options);
@@ -125,6 +126,25 @@ const api = new ApiClass().getAPI({}).tbCalendarBridge;
   api.setDebugLogging(true);
   observers.calendar.onError(calendar, 'TEST', 'debug-visible');
   if (consoleErrors === 0) throw new Error('provider errors not logged when debug logging enabled');
+
+  const descriptionOnly = await api.getSnapshot(start, end, {
+    ...options, truncateDescriptions: true, truncateLocations: false, useCache: false
+  });
+  if (descriptionOnly.calendars[0].events[0].description !== 'abcde…') throw new Error('independent description truncation failed');
+  if (descriptionOnly.calendars[0].events[0].location !== 'Somewhere') throw new Error('location truncation should be independently disabled');
+
+  const locationOnly = await api.getSnapshot(start, end, {
+    ...options, truncateDescriptions: false, truncateLocations: true, useCache: false
+  });
+  if (locationOnly.calendars[0].events[0].description !== 'abcdefghijk') throw new Error('description truncation should be independently disabled');
+  if (locationOnly.calendars[0].events[0].location !== 'Some…') throw new Error('independent location truncation failed');
+
+  const newInstallDefaults = await api.getSnapshot('2026-11-23T00:00:00.000Z', '2026-11-25T00:00:00.000Z', {
+    includeDescriptions: true, includeLocations: true,
+    maxDescriptionChars: 6, maxLocationChars: 5, useCache: false
+  });
+  if (newInstallDefaults.calendars[0].events[0].description !== 'abcde…') throw new Error('description truncation should default to enabled');
+  if (newInstallDefaults.calendars[0].events[0].location !== 'Somewhere') throw new Error('location truncation should default to disabled');
 
   // Batch notifications are coalesced into one extension event.
   let changeEvents = 0;
@@ -154,7 +174,7 @@ const api = new ApiClass().getAPI({}).tbCalendarBridge;
   if (timedOut.calendars[0].status !== 'error') throw new Error('timed-out calendar did not report an error state');
   if (timeoutElapsed < 4900 || timeoutElapsed > 9000) throw new Error(`query timeout duration unexpected: ${timeoutElapsed} ms`);
 
-  console.log('Experiment API mock tests passed: truncation, last-good fallback, debug gating, batch coalescing, concurrency <= 3, query timeout.');
+  console.log('Experiment API mock tests passed: independent truncation, last-good fallback, debug gating, batch coalescing, concurrency <= 3, query timeout.');
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;

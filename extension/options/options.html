@@ -57,14 +57,19 @@
           <input type="checkbox" id="exportLocations">
           Export event locations
         </label>
+        <p class="section-description compact">
+          Locations are exported for future Plasma support, current version does not display them.
+        </p>
         <label class="check">
-          <input type="checkbox" id="truncateText">
-          Truncate long descriptions and locations
+          <input type="checkbox" id="truncateDescriptions">
+          Truncate long descriptions
+        </label>
+        <label class="check">
+          <input type="checkbox" id="truncateLocations">
+          Truncate long locations
         </label>
         <p class="section-description compact">
-          Truncation is enabled by default to keep snapshots small. Each limit can
-          be set independently up to 1000 characters. Locations are exported for
-          future Plasma support; current versions do not display them.
+          Truncate event details to keep snapshots small. Each limit can be set independently up to 1000 characters.
         </p>
 
         <div class="setting">

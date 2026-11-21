@@ -162,7 +162,7 @@ var tbCalendarBridge = (() => {
         text = "";
       }
     }
-    return truncate(text, options.maxDescriptionChars, options.truncateText);
+    return truncate(text, options.maxDescriptionChars, options.truncateDescriptions);
   }
 
   function itemLocation(item, options) {
@@ -170,7 +170,7 @@ var tbCalendarBridge = (() => {
       return truncate(
         item.getProperty("LOCATION") || "",
         options.maxLocationChars,
-        options.truncateText
+        options.truncateLocations
       );
     } catch (error) {
       return "";
@@ -235,7 +235,8 @@ var tbCalendarBridge = (() => {
       endIso,
       options.includeDescriptions ? 1 : 0,
       options.includeLocations ? 1 : 0,
-      options.truncateText ? 1 : 0,
+      options.truncateDescriptions ? 1 : 0,
+      options.truncateLocations ? 1 : 0,
       options.maxDescriptionChars,
       options.maxLocationChars
     ].join("|");
@@ -561,7 +562,16 @@ var tbCalendarBridge = (() => {
             const exportOptions = {
               includeDescriptions: !options || options.includeDescriptions !== false,
               includeLocations: Boolean(options && options.includeLocations === true),
-              truncateText: !options || options.truncateText !== false,
+              // Preserve compatibility with callers using the former shared
+              // switch; the two new settings otherwise operate independently.
+              truncateDescriptions: options && typeof options.truncateDescriptions === "boolean"
+                ? options.truncateDescriptions
+                : (!options || options.truncateText !== false),
+              truncateLocations: options && typeof options.truncateLocations === "boolean"
+                ? options.truncateLocations
+                : (options && typeof options.truncateText === "boolean"
+                  ? options.truncateText
+                  : false),
               maxDescriptionChars: Math.min(1000, Math.max(1, Number(options && options.maxDescriptionChars) || 300)),
               maxLocationChars: Math.min(1000, Math.max(1, Number(options && options.maxLocationChars) || 200)),
               queryTimeoutSeconds: Math.min(300, Math.max(5,

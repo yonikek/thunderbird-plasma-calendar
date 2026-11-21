@@ -99,12 +99,14 @@ input[type="number"] {
 
 .advanced-toggle {
   justify-self: start;
+  margin-block: 0.35em;
 }
 
 .actions {
   display: flex;
   justify-content: flex-start;
-  margin-top: 0.2em;
+  margin-top: 0.45em;
+  margin-bottom: 0.2em;
 }
 
 #status {

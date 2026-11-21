@@ -23,9 +23,8 @@ for (const key of CalendarSettings.NUMERIC_KEYS) {
 }
 
 function updateDependentControls() {
-  const truncationEnabled = inputs.truncateText.checked;
-  const descriptionsEnabled = truncationEnabled && inputs.exportDescriptions.checked;
-  const locationsEnabled = truncationEnabled && inputs.exportLocations.checked;
+  const descriptionsEnabled = inputs.truncateDescriptions.checked && inputs.exportDescriptions.checked;
+  const locationsEnabled = inputs.truncateLocations.checked && inputs.exportLocations.checked;
   ranges.maxDescriptionChars.disabled = !descriptionsEnabled;
   inputs.maxDescriptionChars.disabled = !descriptionsEnabled;
   ranges.maxLocationChars.disabled = !locationsEnabled;

@@ -7,7 +7,7 @@ A read-only integration that shows calendars configured in Mozilla Thunderbird i
 the Plasma 6 Digital Clock, as a `CalendarEvents` provider. It sits beside KDE's
 Akonadi/PIM Events provider; it does not modify Plasma and does not need Akonadi.
 
-**Status: early prototype (0.2.0).** The build and event-export path have been
+**Status: early prototype (0.2.2).** The build and event-export path have been
 smoke-tested with Thunderbird and a Plasma plugin test harness, but not across
 distributions or full desktop sessions. See [Known limitations](#known-limitations).
 
@@ -287,14 +287,24 @@ The main options page provides the number of days to look back and ahead. Use th
 **Show advanced settings** button for the remaining controls:
 
 - export event descriptions (default on) and locations (default off);
-- truncate long descriptions and locations (default on), with independent maximum
-  lengths from 1 to 1000 characters (defaults 300 and 200). When truncation is
-  disabled, the complete text is exported;
+- independently truncate long descriptions (default on) and locations (default off), with
+  separate maximum lengths from 1 to 1000 characters (defaults 300 and 200).
+  Either kind of text can be exported without truncation while the other remains
+  truncated;
 - calendar query timeout (5 to 300 seconds per 30-day query, default 60);
-- **Enable debug logs** (default off). When enabled, refresh timings and
-  calendar-provider, query and native-host errors are written to Thunderbird's
-  Error Console (Ctrl+Shift+J). When disabled, the extension does not emit these
-  diagnostic messages.
+- **Enable debug logs** (default off). When enabled, refresh timings, calendar
+  provider/query diagnostics and native-host phase timings are written to
+  Thunderbird's Error Console (Ctrl+Shift+J). Native-host timings include the
+  wait between messages (reported separately), current-frame reading, JSON
+  parsing, snapshot validation, content hashing, cache-directory setup,
+  previous-cache loading, snapshot serialisation, disk commit and D-Bus
+  notification. The host also reports host processing, response-frame writing
+  and total message-handling time to stderr. The total starts when the first
+  bytes of a request become readable and ends after its response has been
+  written, so it can be compared directly with the extension's native-host
+  acknowledgement duration. When debug logging is disabled, diagnostic timings
+  are omitted. A payload-size rejection is always reported as an actionable
+  error because it requires a settings change to recover.
 
 Numeric settings have both a slider and a number field. Values are saved
 automatically and clamped to their supported ranges. The older `logTiming`
@@ -306,9 +316,12 @@ preference is migrated to `enableDebugLogs` the next time settings are saved.
   then check Thunderbird's Error Console for `Thunderbird Plasma Calendar`
   messages. Also check that `$XDG_CACHE_HOME/plasma-thunderbird-calendar/events.json`
   (normally under `~/.cache`) exists.
-- **"snapshot too large":** the host rejects snapshots over 32 MiB. Disable
-  calendars with very many recurring events or shorten the window in
-  `extension/background.js`.
+- **"snapshot too large":** the complete native-messaging JSON envelope is
+  limited to 32 MiB. The extension checks its UTF-8 size before sending, and the
+  host independently checks the incoming frame. The error reports actual and
+  maximum sizes. Reduce the look-back/look-ahead range, turn off description or
+  location export, or enable text truncation. Size-limit errors are shown even
+  when **Enable debug logs** is off.
 - **No calendars in plugin settings:** start Thunderbird, wait for a refresh, then
   reopen the settings or press **Refresh list**.
 - **Native host not found:** the manifest must be in a directory the relevant
@@ -374,12 +387,67 @@ Thunderbird:
 node tests/experiment-api.cjs
 node tests/settings.cjs
 node tests/background-ack.cjs
+node tests/native-message-limit.cjs
 ```
 
-These cover calendar event truncation, stale-event preservation, debug-log gating,
-batch notification coalescing, query concurrency/timeouts, settings migration,
-value clamping and request-ID acknowledgement. They do not replace testing
-against real Thunderbird calendar providers or a complete Plasma session.
+The first four tests cover independent description/location truncation,
+stale-event preservation, debug-log gating, batch notification coalescing,
+query concurrency/timeouts,
+settings migration, value clamping, request-ID acknowledgement and the extension's
+pre-send 32 MiB guard. They do not replace testing against real Thunderbird
+calendar providers or a complete Plasma session.
+
+After building the native host, test its independent frame-size guard with a
+single 32 MiB + 1 byte test frame:
+
+```sh
+python3 tests/native-host-limit.py ./build/thunderbird-calendar-native-host
+```
+
+For a Nix build, pass the installed host executable from the build result instead
+of the local `./build` path. The test sends an intentionally oversized raw frame
+and verifies that the host drains it, returns a structured
+`NATIVE_MESSAGE_TOO_LARGE` response containing the received and maximum byte
+counts, and exits normally. It does not modify the calendar cache.
+
+After building the host, also verify the timing fields and total message duration:
+
+```sh
+python3 tests/native-host-timing.py ./build/thunderbird-calendar-native-host
+```
+
+This sends a minimal valid snapshot with debug logging enabled, checks that the
+response contains the wait, frame-read and host-processing measurements, and
+checks stderr for response-frame writing and total message-handling duration. It
+uses a temporary `XDG_CACHE_HOME` so it does not overwrite the user's real cache.
+
+### Checking native-host phase timings
+
+1. Rebuild and reinstall the project so Thunderbird launches the updated native
+   host executable. Rebuilding only the XPI is not sufficient for host timings.
+2. In Thunderbird, open the add-on's options and enable **Enable debug logs**.
+3. Open the Error Console with Ctrl+Shift+J and trigger a calendar change, or
+   wait for the next refresh.
+4. Find the `Thunderbird Plasma Calendar: native host phases (ms)` line. It reports
+   the wait between requests separately from receiving the current frame, followed
+   by JSON parsing, validation, content hashing, cache preparation, serialisation,
+   disk commit and D-Bus notification.
+5. In the same Error Console, find the native-host stderr line beginning
+   `native-host message timing (ms)`. It reports current-frame reading, host
+   processing, response-frame writing and **total message handling**. Compare that
+   total with `native host acknowledgement` in the extension's refresh line. They
+   should be close; their difference is mainly extension/runtime-to-host transport
+   and scheduling overhead. The `wait before message` value is deliberately excluded
+   from both current-frame reading and total message handling: it measures the idle
+   interval between native-messaging requests, which can include the time Thunderbird
+   spends querying calendars before it sends the next snapshot.
+
+The host uses `poll()` to detect readable input before starting the frame timer, and
+reads directly from the file descriptor so C++ stream-buffer prefetch cannot hide a
+subsequent frame from `poll()`. Total message handling starts when the first bytes
+become readable and ends after the response frame is written. Timing diagnostics are
+emitted only when the request carries `debugLogs: true`; actionable payload-size
+rejections remain visible regardless of that preference.
 
 ## License
 

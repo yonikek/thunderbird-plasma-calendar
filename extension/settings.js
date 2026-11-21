@@ -8,7 +8,8 @@ const CalendarSettings = (() => {
     lookAheadDays: 360,
     exportDescriptions: true,
     exportLocations: false,
-    truncateText: true,
+    truncateDescriptions: true,
+    truncateLocations: false,
     maxDescriptionChars: 300,
     maxLocationChars: 200,
     queryTimeoutSeconds: 60,
@@ -26,11 +27,12 @@ const CalendarSettings = (() => {
   const BOOLEAN_KEYS = Object.freeze([
     "exportDescriptions",
     "exportLocations",
-    "truncateText",
+    "truncateDescriptions",
+    "truncateLocations",
     "enableDebugLogs"
   ]);
   const NUMERIC_KEYS = Object.freeze(Object.keys(LIMITS));
-  const STORAGE_KEYS = Object.freeze([...Object.keys(DEFAULTS), "logTiming"]);
+  const STORAGE_KEYS = Object.freeze([...Object.keys(DEFAULTS), "logTiming", "truncateText"]);
 
   function clampNumber(value, key) {
     if (value === null || value === undefined || String(value).trim() === "") {
@@ -57,8 +59,14 @@ const CalendarSettings = (() => {
         ? source.exportDescriptions : DEFAULTS.exportDescriptions,
       exportLocations: typeof source.exportLocations === "boolean"
         ? source.exportLocations : DEFAULTS.exportLocations,
-      truncateText: typeof source.truncateText === "boolean"
-        ? source.truncateText : DEFAULTS.truncateText,
+      // Migrate the former shared toggle independently, while allowing either
+      // new preference to be present without overwriting the other one.
+      truncateDescriptions: typeof source.truncateDescriptions === "boolean"
+        ? source.truncateDescriptions
+        : (typeof source.truncateText === "boolean" ? source.truncateText : DEFAULTS.truncateDescriptions),
+      truncateLocations: typeof source.truncateLocations === "boolean"
+        ? source.truncateLocations
+        : (typeof source.truncateText === "boolean" ? source.truncateText : DEFAULTS.truncateLocations),
       maxDescriptionChars: clampNumber(source.maxDescriptionChars, "maxDescriptionChars"),
       maxLocationChars: clampNumber(source.maxLocationChars, "maxLocationChars"),
       queryTimeoutSeconds: clampNumber(source.queryTimeoutSeconds, "queryTimeoutSeconds"),
@@ -80,7 +88,7 @@ const CalendarSettings = (() => {
     await browser.storage.local.set(normalized);
     // Remove the previous key after the new preference has been persisted.
     try {
-      await browser.storage.local.remove("logTiming");
+      await browser.storage.local.remove(["logTiming", "truncateText"]);
     } catch (error) {
       // Older storage implementations may not support remove; the new key wins.
     }
