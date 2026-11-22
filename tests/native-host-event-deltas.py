@@ -308,6 +308,9 @@ def inside_test(host_path: Path) -> int:
             stored = json.loads(cache_file.read_text(encoding="utf-8"))
             metadata_revision = stored["contentRevision"]
             assert metadata_envelope["revision"] == metadata_revision
+            metadata_journal = cache_file.with_name("events.journal").read_text(encoding="utf-8").splitlines()
+            assert len(metadata_journal) == 1, metadata_journal
+            assert json.loads(metadata_journal[0])["baseRevision"] == metadata_revision
 
             # More than one signal's worth of changes must be split into
             # ordered batches, all sharing the same revision pair.
@@ -342,8 +345,8 @@ def inside_test(host_path: Path) -> int:
             assert len(stored_events) == 67, len(stored_events)
             assert stored["contentRevision"] == batches[0]["revision"]
 
-            # Direct observer updates must patch only the changed UIDs in the
-            # existing cached snapshot; they do not require another full snapshot.
+            # Direct observer updates are written to the append-only journal,
+            # not by rewriting events.json for every individual change.
             direct_changes = [
                 {"operation": "modify", "calendarId": "test-calendar",
                  "event": make_event("test-calendar:event-1:", "Directly modified title",
@@ -352,13 +355,43 @@ def inside_test(host_path: Path) -> int:
                  "event": make_event("test-calendar:bulk-0:", "Bulk event 0")},
                 {"operation": "add", "calendarId": "test-calendar",
                  "event": make_event("test-calendar:direct-new:", "Direct observer addition")},
+                # Intentionally provide additions in non-sorted order. The host
+                # and readers must use deterministic UID ordering when replaying
+                # the journal so the reconstructed content revision is stable.
+                {"operation": "add", "calendarId": "test-calendar",
+                 "event": make_event("test-calendar:direct-z:", "Direct Z addition")},
+                {"operation": "add", "calendarId": "test-calendar",
+                 "event": make_event("test-calendar:direct-a:", "Direct A addition")},
             ]
             response = send_request(host, {
-                "type": "eventChanges", "requestId": "direct", "debugLogs": False,
+                "type": "eventChanges", "requestId": "direct", "debugLogs": True,
                 "changes": direct_changes,
             })
             assert response.get("ok") is True, response
             assert response.get("requestId") == "direct", response
+            direct_timings = response.get("hostTimingsMs", {})
+            required_direct_timings = (
+                "messageType", "frameReadMs", "jsonParseMs", "cacheDirectoryMs",
+                "existingCacheReadMs", "cacheValidationMs", "calendarIndexMs",
+                "changeValidationMs", "eventIndexMs", "eventApplyMs",
+                "eventArrayRebuildMs", "eventDiffMs", "contentHashMs",
+                "snapshotSerializationMs", "diskCommitMs", "dbusNotifyMs",
+                "journalReplayMs", "journalSerializationMs", "journalAppendMs",
+                "journalFsyncMs", "journalCompactionMs", "journalRecordCount",
+                "journalFileBytes", "journalWriteBytes", "journalCompacted",
+                "hostProcessingMs", "directChangeCount", "affectedCalendarCount",
+                "eventDeltaCount", "cacheWriteBytes", "unchanged",
+            )
+            missing_direct_timings = [name for name in required_direct_timings if name not in direct_timings]
+            assert not missing_direct_timings, ("direct update response omitted timing fields", missing_direct_timings, response)
+            assert direct_timings["messageType"] == "eventChanges", direct_timings
+            assert direct_timings["directChangeCount"] == 5, direct_timings
+            assert direct_timings["affectedCalendarCount"] == 1, direct_timings
+            assert direct_timings["eventDeltaCount"] == 5, direct_timings
+            assert direct_timings["journalRecordCount"] == 1, direct_timings
+            assert direct_timings["journalWriteBytes"] > 0, direct_timings
+            assert direct_timings["journalCompacted"] is False, direct_timings
+
             direct_payload = wait_signal(monitor_lines, "EventsDelta")
             if direct_payload is None:
                 raise AssertionError("direct observer changes did not emit EventsDelta")
@@ -371,18 +404,150 @@ def inside_test(host_path: Path) -> int:
                 ("modify", "test-calendar:event-1:"),
                 ("remove", "test-calendar:bulk-0:"),
                 ("add", "test-calendar:direct-new:"),
+                ("add", "test-calendar:direct-z:"),
+                ("add", "test-calendar:direct-a:"),
             }, direct_operations
             assert direct_operations[("modify", "test-calendar:event-1:")]["event"]["title"] == "Directly modified title"
             assert direct_operations[("modify", "test-calendar:event-1:")]["previous"]["start"] == "2026-11-21T09:00:00.000Z"
             assert direct_operations[("modify", "test-calendar:event-1:")]["event"]["start"] == "2026-11-22T11:00:00.000Z"
-            direct_stored = json.loads(cache_file.read_text(encoding="utf-8"))
-            assert response.get("revision") == direct_stored["contentRevision"], response
-            direct_events = {event["uid"]: event for event in direct_stored["calendars"][0]["events"]}
-            assert "test-calendar:bulk-0:" not in direct_events
-            assert direct_events["test-calendar:event-1:"]["title"] == "Directly modified title"
-            assert "test-calendar:direct-new:" in direct_events
+            direct_revision = response.get("revision")
             assert direct_envelope["previousRevision"] == batches[0]["revision"]
-            assert direct_envelope["revision"] == direct_stored["contentRevision"]
+            assert direct_envelope["revision"] == direct_revision
+
+            # events.json remains the last compacted full snapshot. The direct
+            # changes are durable in a small JSONL journal record instead.
+            compacted_stored = json.loads(cache_file.read_text(encoding="utf-8"))
+            assert compacted_stored["contentRevision"] == batches[0]["revision"]
+            assert len(compacted_stored["calendars"][0]["events"]) == 67
+            journal_file = cache_file.with_name("events.journal")
+            journal_lines = journal_file.read_text(encoding="utf-8").splitlines()
+            assert len(journal_lines) == 2, journal_lines
+            journal_header, journal_record = map(json.loads, journal_lines)
+            assert journal_header["type"] == "header", journal_header
+            assert journal_header["baseRevision"] == batches[0]["revision"], journal_header
+            assert journal_record["previousRevision"] == batches[0]["revision"], journal_record
+            assert journal_record["revision"] == direct_revision, journal_record
+            assert len(journal_record["deltas"]) == 5, journal_record
+
+            # Restarting the host must replay the durable journal over the last
+            # compacted snapshot before accepting another direct change.
+            host.stdin.close()
+            host.wait(timeout=5)
+            if host_stderr_reader is not None:
+                host_stderr_reader.join(timeout=1)
+            if host.returncode != 0:
+                raise AssertionError(f"native host exited with {host.returncode}: "
+                                     f"{queued_diagnostics(host_stderr_lines)}")
+
+            # Simulate a process crash while the last JSONL append is being
+            # written. The incomplete, unacknowledged tail must be discarded
+            # while all preceding fsync'd records remain replayable.
+            with journal_file.open("ab") as journal_stream:
+                journal_stream.write(b'{"type":"delta","schemaVersion":1,"torn":')
+                journal_stream.flush()
+
+            host = subprocess.Popen(
+                [str(host_path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, env=env,
+            )
+            host_stderr_reader = threading.Thread(
+                target=read_binary_lines, args=(host.stderr, host_stderr_lines), daemon=True
+            )
+            host_stderr_reader.start()
+            recovery_change = {
+                "operation": "modify", "calendarId": "test-calendar",
+                "event": make_event("test-calendar:direct-new:", "Recovered then modified"),
+            }
+            response = send_request(host, {
+                "type": "eventChanges", "requestId": "journal-replay", "debugLogs": True,
+                "changes": [recovery_change],
+            })
+            assert response.get("ok") is True, response
+            replay_payload = wait_signal(monitor_lines, "EventsDelta")
+            if replay_payload is None:
+                raise AssertionError("host did not emit a delta after replaying its journal")
+            replay_envelope = json.loads(replay_payload)
+            assert replay_envelope["previousRevision"] == direct_revision, replay_envelope
+            replay_revision = response.get("revision")
+            assert replay_envelope["revision"] == replay_revision, replay_envelope
+            replay_timings = response.get("hostTimingsMs", {})
+            assert replay_timings.get("journalRecordsReplayed") == 1, replay_timings
+            repaired_journal_lines = journal_file.read_text(encoding="utf-8").splitlines()
+            # The repaired journal contains its header, the original direct
+            # update record replayed after restart, and the new recovery_change
+            # record appended by the request above. The incomplete torn tail
+            # must be absent; expecting only two lines here would incorrectly
+            # reject the valid post-recovery append.
+            assert len(repaired_journal_lines) == 3, repaired_journal_lines
+            repaired_header, original_record, recovery_record = map(
+                json.loads, repaired_journal_lines
+            )
+            assert repaired_header["type"] == "header", repaired_header
+            assert repaired_header["baseRevision"] == batches[0]["revision"], repaired_header
+            assert original_record["previousRevision"] == batches[0]["revision"], original_record
+            assert original_record["revision"] == direct_revision, original_record
+            assert recovery_record["previousRevision"] == direct_revision, recovery_record
+            assert recovery_record["revision"] == replay_revision, recovery_record
+            assert recovery_record["type"] == "delta", recovery_record
+            assert recovery_record["schemaVersion"] == 1, recovery_record
+            assert len(recovery_record["deltas"]) == 1, recovery_record
+            assert recovery_record["deltas"][0]["operation"] == "modify", recovery_record
+            assert recovery_record["deltas"][0]["event"]["uid"] == "test-calendar:direct-new:", recovery_record
+            assert recovery_record["deltas"][0]["event"]["title"] == "Recovered then modified", recovery_record
+
+            # A complete snapshot matching the recovered journal state is
+            # recognised as unchanged, proving replay reconstructed the same
+            # event collection rather than merely accepting the next delta.
+            recovered_events = [
+                make_event("test-calendar:event-1:", "Directly modified title",
+                           "2026-11-22T11:00:00.000Z", "2026-11-22T12:00:00.000Z"),
+                make_event("test-calendar:event-2:", "New event"),
+            ]
+            recovered_events.extend(
+                make_event(f"test-calendar:bulk-{index}:", f"Bulk event {index}")
+                for index in range(1, 65)
+            )
+            recovered_events.extend([
+                make_event("test-calendar:direct-a:", "Direct A addition"),
+                make_event("test-calendar:direct-new:", "Recovered then modified"),
+                make_event("test-calendar:direct-z:", "Direct Z addition"),
+            ])
+            recovered_snapshot = make_snapshot(recovered_events)
+            recovered_snapshot["calendars"][0]["name"] = "Renamed test calendar"
+            response = send_request(host, {
+                "type": "snapshot", "requestId": "verify-replay", "debugLogs": True,
+                "snapshot": recovered_snapshot,
+            })
+            assert response.get("ok") is True, response
+            assert response.get("hostTimingsMs", {}).get("unchanged") is True, response
+
+            # Exercise journal compaction at its record threshold (128). The
+            # host should atomically write one new full snapshot and reset the
+            # journal to a single header line.
+            compaction_response = None
+            for index in range(126):
+                event = make_event(
+                    "test-calendar:direct-new:", f"Compaction update {index + 1}"
+                )
+                compaction_response = send_request(host, {
+                    "type": "eventChanges", "requestId": f"compact-{index + 1}",
+                    "debugLogs": index == 125,
+                    "changes": [{
+                        "operation": "modify", "calendarId": "test-calendar", "event": event
+                    }],
+                })
+                assert compaction_response.get("ok") is True, compaction_response
+            assert compaction_response is not None
+            compact_timings = compaction_response.get("hostTimingsMs", {})
+            assert compact_timings.get("journalCompacted") is True, compact_timings
+            assert compact_timings.get("journalRecordCount") == 0, compact_timings
+            compacted_stored = json.loads(cache_file.read_text(encoding="utf-8"))
+            compacted_events = {event["uid"]: event for event in compacted_stored["calendars"][0]["events"]}
+            assert compacted_events["test-calendar:direct-new:"]["title"] == "Compaction update 126"
+            compacted_journal_lines = journal_file.read_text(encoding="utf-8").splitlines()
+            assert len(compacted_journal_lines) == 1, compacted_journal_lines
+            compacted_header = json.loads(compacted_journal_lines[0])
+            assert compacted_header["baseRevision"] == compacted_stored["contentRevision"], compacted_header
 
             # If an event arrives for a calendar that is absent from the host's
             # recovery snapshot, the extension must rebuild a full snapshot.
@@ -405,11 +570,17 @@ def inside_test(host_path: Path) -> int:
                                      f"{queued_diagnostics(host_stderr_lines)}")
             print("Native-host event-delta integration test passed:")
             print("- Initial snapshot emitted EventsChanged")
-            print("- One modify, one add and one remove emitted through EventsDelta")
+            print("- One modify, three additions and one removal emitted through EventsDelta")
+            print("- Multiple direct additions replayed in deterministic event order")
             print("- Metadata-only change emitted an empty revision-advancing batch")
             print("- 65 additions were split into ordered 64 + 1 batches")
             print("- Updated full snapshot was persisted for recovery")
-            print("- Direct add/modify/remove observer changes were applied without a full snapshot")
+            print("- Direct add/modify/remove observer changes were journaled without rewriting the full snapshot")
+            print("- Journal recovery reconstructed direct changes after restarting the native host")
+            print("- Incomplete journal tail was discarded before the post-recovery update was appended as a second valid record")
+            print("- Matching full snapshots were recognised as unchanged after journal replay")
+            print("- 128 direct update records triggered atomic snapshot compaction and journal reset")
+            print("- Direct-update timings cover journal serialisation, append, fsync and compaction")
             print("- Date-moving modification preserved old and new start dates in the delta")
             print("- Both raw-quoted and escaped dbus-monitor string formats decoded correctly")
             print("- Missing calendars correctly requested a full-snapshot recovery")

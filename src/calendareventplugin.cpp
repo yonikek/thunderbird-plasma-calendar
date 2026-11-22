@@ -11,12 +11,17 @@
 #include <QDateTime>
 #include <QDebug>
 #include <QFile>
+#include <QHash>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMultiHash>
 #include <QStandardPaths>
+#include <QStringList>
 #include <QTime>
+
+#include <algorithm>
+#include <utility>
 
 namespace
 {
@@ -24,10 +29,244 @@ constexpr auto BusPath = "/org/kde/ThunderbirdCalendar";
 constexpr auto BusInterface = "org.kde.ThunderbirdCalendar";
 constexpr auto ConfigGroupName = "ThunderbirdCalendarPlugin";
 
-QString snapshotPath()
+QString cacheDirectoryPath()
 {
     return QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation)
-        + QStringLiteral("/plasma-thunderbird-calendar/events.json");
+        + QStringLiteral("/plasma-thunderbird-calendar");
+}
+
+QString snapshotPath()
+{
+    return cacheDirectoryPath() + QStringLiteral("/events.json");
+}
+
+QString journalPath()
+{
+    return cacheDirectoryPath() + QStringLiteral("/events.journal");
+}
+
+constexpr qint64 MaxJournalBytes = 16 * 1024 * 1024;
+constexpr int MaxEventsPerCalendar = 100000;
+
+QByteArray contentDigest(QJsonObject snapshot)
+{
+    snapshot.remove(QStringLiteral("generatedAt"));
+    snapshot.remove(QStringLiteral("rangeStart"));
+    snapshot.remove(QStringLiteral("rangeEnd"));
+    snapshot.remove(QStringLiteral("contentRevision"));
+    return QCryptographicHash::hash(
+        QJsonDocument(snapshot).toJson(QJsonDocument::Compact), QCryptographicHash::Sha256).toHex();
+}
+
+QByteArray journalRecordChecksum(QJsonObject record)
+{
+    record.remove(QStringLiteral("checksum"));
+    return QCryptographicHash::hash(
+        QJsonDocument(record).toJson(QJsonDocument::Compact), QCryptographicHash::Sha256).toHex();
+}
+
+bool applyJournalDeltas(QJsonObject *snapshot, const QJsonArray &deltas, QString *error)
+{
+    QJsonArray calendars = snapshot->value(QStringLiteral("calendars")).toArray();
+    QHash<QString, int> calendarIndexes;
+    for (qsizetype index = 0; index < calendars.size(); ++index) {
+        const QString id = calendars.at(index).toObject().value(QStringLiteral("id")).toString();
+        if (!id.isEmpty()) {
+            calendarIndexes.insert(id, static_cast<int>(index));
+        }
+    }
+
+    QHash<QString, QHash<QString, QJsonObject>> grouped;
+    for (const QJsonValue &value : deltas) {
+        if (!value.isObject()) {
+            *error = QStringLiteral("journal delta is not an object");
+            return false;
+        }
+        const QJsonObject delta = value.toObject();
+        const QString operation = delta.value(QStringLiteral("operation")).toString();
+        const QString calendarId = delta.value(QStringLiteral("calendarId")).toString();
+        const QJsonValue eventValue = delta.value(QStringLiteral("event"));
+        if (!eventValue.isObject()) {
+            *error = QStringLiteral("journal delta has no event object");
+            return false;
+        }
+        const QJsonObject event = eventValue.toObject();
+        const QString uid = event.value(QStringLiteral("uid")).toString();
+        if ((operation != QStringLiteral("add") && operation != QStringLiteral("modify")
+             && operation != QStringLiteral("remove"))
+            || calendarId.isEmpty() || uid.isEmpty() || !calendarIndexes.contains(calendarId)) {
+            *error = QStringLiteral("journal delta has an invalid operation, UID or calendar ID");
+            return false;
+        }
+        grouped[calendarId].insert(uid, delta);
+    }
+
+    for (auto group = grouped.cbegin(); group != grouped.cend(); ++group) {
+        const int calendarIndex = calendarIndexes.value(group.key());
+        QJsonObject calendar = calendars.at(calendarIndex).toObject();
+        const QJsonArray oldEvents = calendar.value(QStringLiteral("events")).toArray();
+        QHash<QString, QJsonObject> eventMap;
+        QStringList order;
+        eventMap.reserve(oldEvents.size() + group.value().size());
+        order.reserve(oldEvents.size() + group.value().size());
+        for (const QJsonValue &eventValue : oldEvents) {
+            const QJsonObject event = eventValue.toObject();
+            const QString uid = event.value(QStringLiteral("uid")).toString();
+            if (!uid.isEmpty() && !eventMap.contains(uid)) {
+                eventMap.insert(uid, event);
+                order.append(uid);
+            }
+        }
+
+        QStringList orderedUids = group.value().keys();
+        std::sort(orderedUids.begin(), orderedUids.end());
+        for (const QString &uid : std::as_const(orderedUids)) {
+            const QJsonObject delta = group.value().value(uid);
+            const QString operation = delta.value(QStringLiteral("operation")).toString();
+            const QJsonObject event = delta.value(QStringLiteral("event")).toObject();
+            const auto existing = eventMap.constFind(uid);
+            if (operation == QStringLiteral("remove")) {
+                if (existing == eventMap.cend()) {
+                    *error = QStringLiteral("journal removes missing event '%1'").arg(uid);
+                    return false;
+                }
+                eventMap.remove(uid);
+            } else if (operation == QStringLiteral("add")) {
+                if (existing != eventMap.cend()) {
+                    *error = QStringLiteral("journal adds existing event '%1'").arg(uid);
+                    return false;
+                }
+                eventMap.insert(uid, event);
+                order.append(uid);
+            } else {
+                if (existing == eventMap.cend()) {
+                    *error = QStringLiteral("journal modifies missing event '%1'").arg(uid);
+                    return false;
+                }
+                const QJsonValue previous = delta.value(QStringLiteral("previous"));
+                if (previous.isObject() && existing.value() != previous.toObject()) {
+                    *error = QStringLiteral("journal modification has an unexpected previous value for '%1'").arg(uid);
+                    return false;
+                }
+                eventMap.insert(uid, event);
+            }
+        }
+
+        QJsonArray updatedEvents;
+        for (const QString &uid : std::as_const(order)) {
+            const auto event = eventMap.constFind(uid);
+            if (event != eventMap.cend()) {
+                updatedEvents.append(event.value());
+            }
+        }
+        if (updatedEvents.size() > MaxEventsPerCalendar) {
+            *error = QStringLiteral("journal exceeds the event limit for calendar '%1'").arg(group.key());
+            return false;
+        }
+        calendar.insert(QStringLiteral("events"), updatedEvents);
+        calendars.replace(calendarIndex, calendar);
+    }
+
+    snapshot->insert(QStringLiteral("calendars"), calendars);
+    return true;
+}
+
+bool replayJournal(QJsonObject *snapshot, QString *error)
+{
+    const QString path = journalPath();
+    if (!QFile::exists(path)) {
+        return true;
+    }
+    QFile journal(path);
+    if (!journal.open(QIODevice::ReadOnly)) {
+        *error = QStringLiteral("could not open event journal: %1").arg(journal.errorString());
+        return false;
+    }
+    if (journal.size() > MaxJournalBytes) {
+        *error = QStringLiteral("event journal exceeds the %1 MiB safety limit")
+            .arg(MaxJournalBytes / (1024 * 1024));
+        return false;
+    }
+    const QByteArray contents = journal.readAll();
+    const qsizetype headerEnd = contents.indexOf('\n');
+    if (headerEnd < 0) {
+        *error = QStringLiteral("event journal has no complete header");
+        return false;
+    }
+
+    QJsonParseError parseError{};
+    const QJsonDocument headerDocument = QJsonDocument::fromJson(contents.left(headerEnd), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !headerDocument.isObject()) {
+        *error = QStringLiteral("event journal header is invalid");
+        return false;
+    }
+    const QJsonObject header = headerDocument.object();
+    if (header.value(QStringLiteral("type")).toString() != QStringLiteral("header")
+        || header.value(QStringLiteral("schemaVersion")).toInt(-1) != 1
+        || !header.value(QStringLiteral("baseRevision")).isString()) {
+        *error = QStringLiteral("event journal header has an unsupported schema");
+        return false;
+    }
+
+    const QString baseRevision = QString::fromLatin1(contentDigest(*snapshot));
+    const QString storedBaseRevision = snapshot->value(QStringLiteral("contentRevision")).toString();
+    if (!storedBaseRevision.isEmpty() && storedBaseRevision != baseRevision) {
+        *error = QStringLiteral("base snapshot does not match its stored content revision");
+        return false;
+    }
+    if (header.value(QStringLiteral("baseRevision")).toString() != baseRevision) {
+        // A full snapshot is committed before the journal header is reset.
+        // If a crash occurs between those operations, the newer snapshot wins.
+        return true;
+    }
+
+    snapshot->insert(QStringLiteral("contentRevision"), baseRevision);
+    QString currentRevision = baseRevision;
+    qsizetype offset = headerEnd + 1;
+    while (offset < contents.size()) {
+        const qsizetype lineEnd = contents.indexOf('\n', offset);
+        if (lineEnd < 0) {
+            // Ignore only an incomplete trailing append. The native host will
+            // truncate it when it next opens the journal for recovery.
+            break;
+        }
+        const QByteArray line = contents.mid(offset, lineEnd - offset);
+        const QJsonDocument recordDocument = QJsonDocument::fromJson(line, &parseError);
+        if (parseError.error != QJsonParseError::NoError || !recordDocument.isObject()) {
+            *error = QStringLiteral("event journal contains an invalid complete record");
+            return false;
+        }
+        const QJsonObject record = recordDocument.object();
+        const QString previousRevision = record.value(QStringLiteral("previousRevision")).toString();
+        const QString revision = record.value(QStringLiteral("revision")).toString();
+        const QJsonValue deltas = record.value(QStringLiteral("deltas"));
+        if (record.value(QStringLiteral("type")).toString() != QStringLiteral("delta")
+            || record.value(QStringLiteral("schemaVersion")).toInt(-1) != 1
+            || previousRevision != currentRevision || revision.isEmpty() || !deltas.isArray()
+            || record.value(QStringLiteral("checksum")).toString().toLatin1() != journalRecordChecksum(record)) {
+            *error = QStringLiteral("event journal revision chain or checksum is invalid");
+            return false;
+        }
+        QString applyError;
+        if (!applyJournalDeltas(snapshot, deltas.toArray(), &applyError)) {
+            *error = QStringLiteral("could not replay event journal: %1").arg(applyError);
+            return false;
+        }
+        const QString generatedAt = record.value(QStringLiteral("generatedAt")).toString();
+        if (!generatedAt.isEmpty()) {
+            snapshot->insert(QStringLiteral("generatedAt"), generatedAt);
+        }
+        snapshot->insert(QStringLiteral("contentRevision"), revision);
+        currentRevision = revision;
+        offset = lineEnd + 1;
+    }
+
+    const QString actualRevision = QString::fromLatin1(contentDigest(*snapshot));
+    if (actualRevision != currentRevision) {
+        *error = QStringLiteral("replayed event journal does not match its final content revision");
+        return false;
+    }
+    return true;
 }
 
 QDateTime parseDateTime(const QString &value, bool allDay)
@@ -153,7 +392,15 @@ QJsonObject readSnapshot(QString *error = nullptr)
         }
         return {};
     }
-    return document.object();
+    QJsonObject snapshot = document.object();
+    QJsonObject replayedSnapshot = snapshot;
+    QString journalError;
+    if (replayJournal(&replayedSnapshot, &journalError)) {
+        snapshot = replayedSnapshot;
+    } else {
+        qWarning() << "Thunderbird Calendar: ignoring invalid event journal:" << journalError;
+    }
+    return snapshot;
 }
 
 QString revisionForSnapshot(QJsonObject snapshot)

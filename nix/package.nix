@@ -9,7 +9,7 @@
 
 stdenv.mkDerivation {
   pname = "thunderbird-plasma-calendar";
-  version = "0.4.4";
+  version = "0.4.7";
   src = lib.cleanSourceWith {
     # cleanSource drops .git, result symlinks and editor backups so that
     # unrelated changes do not alter the derivation.

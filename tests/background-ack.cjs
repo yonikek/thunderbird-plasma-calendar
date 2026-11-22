@@ -46,10 +46,20 @@ const port = {
         frameReadMs: 2.1,
         jsonParseMs: 1.2,
         validationMs: 0.3,
+        cacheValidationMs: 0.0,
         contentHashMs: 0.7,
         cacheDirectoryMs: 0.2,
         existingCacheReadMs: 0.0,
         cachePreparationMs: 0.2,
+        calendarIndexMs: 0.1,
+        changeValidationMs: 0.2,
+        eventIndexMs: 0.4,
+        eventApplyMs: 0.1,
+        eventArrayRebuildMs: 0.2,
+        eventDiffMs: 0.7,
+        directChangeCount: message.type === "eventChanges" ? message.changes.length : 0,
+        affectedCalendarCount: message.type === "eventChanges" ? 1 : 0,
+        eventDeltaCount: message.type === "eventChanges" ? message.changes.length : 0,
         snapshotSerializationMs: 0.8,
         diskCommitMs: 1.4,
         dbusNotifyMs: 0.1,
@@ -163,7 +173,13 @@ vm.runInContext(
   assert.equal(directMessage.changes.length, 1);
   assert.equal(directMessage.changes[0].operation, "add");
   assert.equal(directMessage.debugLogs, true);
-  console.log("Background test passed: initial snapshot acknowledgement, direct item-change delivery and debug-gated host timings.");
+  assert.ok(logLines.some(line => line.includes("native host direct-update phases (ms)")),
+    "direct event updates log their own native-host phase breakdown");
+  assert.ok(logLines.some(line => line.includes("event lookup/index")),
+    "direct timing output distinguishes event indexing from applying changes");
+  assert.ok(logLines.some(line => line.includes("event-array rebuild")),
+    "direct timing output measures rebuilding the affected calendar event array");
+  console.log("Background test passed: initial snapshot acknowledgement, direct item-change delivery and direct native-host phase timings.");
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;

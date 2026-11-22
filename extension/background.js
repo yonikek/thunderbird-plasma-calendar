@@ -186,9 +186,12 @@ async function flushItemChanges() {
   const changes = batchEntries.map(([, change]) => change);
 
   try {
+    const directUpdateStarted = performance.now();
     const response = await sendNativeMessageAndWait({ type: "eventChanges", changes });
+    const directUpdateAcknowledged = performance.now();
     if (debugLogsEnabled) {
       debugLog("log", `sent ${changes.length} direct item changes; host applied ${Number(response.appliedChanges || 0)}; revision ${response.revision || "unchanged"}`);
+      logDirectUpdateTiming(changes.length, directUpdateStarted, directUpdateAcknowledged, response);
     }
     reconnectDelayMs = RECONNECT_BASE_MS;
   } catch (error) {
@@ -346,6 +349,58 @@ function logTiming(snapshot, started, readFinished, acknowledged, delivery) {
   } catch (error) {
     debugLog("warn", "could not log timing:", error);
   }
+}
+
+function logDirectUpdateTiming(changeCount, started, acknowledged, response) {
+  const phases = response && response.hostTimingsMs;
+  if (!phases || typeof phases !== "object") {
+    return;
+  }
+
+  const phase = name => Number(phases[name] || 0).toFixed(1);
+  const acknowledgementMs = acknowledged - started;
+  const hostFrameReadMs = Number(phases.frameReadMs || 0);
+  const hostProcessingMs = Number(phases.hostProcessingMs || 0);
+  const transportOverheadMs = Math.max(0, acknowledgementMs - hostFrameReadMs - hostProcessingMs);
+
+  debugLog("log",
+    `direct update acknowledgement took ${Math.round(acknowledgementMs)} ms; ` +
+    `${changeCount} queued changes, ${Number(phases.eventDeltaCount || 0)} applied deltas, ` +
+    `${Number(phases.affectedCalendarCount || 0)} affected calendars`
+  );
+  debugLog("log",
+    "native host direct-update phases (ms): " +
+    "frame read " + phase("frameReadMs") +
+    ", JSON parse " + phase("jsonParseMs") +
+    ", cache directory " + phase("cacheDirectoryMs") +
+    ", recovery cache read " + phase("existingCacheReadMs") +
+    ", recovery cache validation " + phase("cacheValidationMs") +
+    ", calendar index " + phase("calendarIndexMs") +
+    ", change validation/grouping " + phase("changeValidationMs") +
+    ", event lookup/index " + phase("eventIndexMs") +
+    ", event application " + phase("eventApplyMs") +
+    ", event-array rebuild " + phase("eventArrayRebuildMs") +
+    ", event diff total " + phase("eventDiffMs") +
+    ", revision hash " + phase("contentHashMs") +
+    ", snapshot serialisation " + phase("snapshotSerializationMs") +
+    ", disk commit " + phase("diskCommitMs")
+    + ", D-Bus notification " + phase("dbusNotifyMs")
+    + ", journal serialisation " + phase("journalSerializationMs")
+    + ", journal append " + phase("journalAppendMs")
+    + ", journal fsync " + phase("journalFsyncMs")
+    + ", journal compaction " + phase("journalCompactionMs")
+    + ", journal records " + Number(phases.journalRecordCount || 0)
+    + ", journal size " + Number(phases.journalFileBytes || 0) + " bytes"
+    + ", journal write " + Number(phases.journalWriteBytes || 0) + " bytes"
+    + (phases.journalCompacted === true ? ", journal compacted" : ", journal not compacted")
+    + ", host processing " + phase("hostProcessingMs")
+    + ", transport/extension overhead ~" + transportOverheadMs.toFixed(1) +
+    " ms, input changes " + Number(phases.directChangeCount || changeCount) +
+    ", affected calendars " + Number(phases.affectedCalendarCount || 0) +
+    ", applied deltas " + Number(phases.eventDeltaCount || 0) +
+    ", cache write " + Number(phases.cacheWriteBytes || 0) + " bytes" +
+    (phases.unchanged === true ? ", cache unchanged" : ", cache updated")
+  );
 }
 
 function requestRefresh() {
