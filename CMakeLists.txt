@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(thunderbird-plasma-calendar VERSION 0.2.2 LANGUAGES CXX)
+project(thunderbird-plasma-calendar VERSION 0.9.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,6 +24,39 @@ find_package(KF6CoreAddons 6.0 CONFIG REQUIRED)
 find_package(KF6Declarative 6.0 CONFIG REQUIRED)
 find_package(KF6Config 6.0 CONFIG REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(thunderbird-calendar-floating-time-test tests/floating-time.cpp)
+    target_link_libraries(thunderbird-calendar-floating-time-test PRIVATE Qt6::Core)
+    add_test(NAME thunderbird-calendar-floating-time-london
+        COMMAND thunderbird-calendar-floating-time-test)
+    set_tests_properties(thunderbird-calendar-floating-time-london PROPERTIES
+        ENVIRONMENT "TZ=Europe/London")
+    add_test(NAME thunderbird-calendar-floating-time-new-york
+        COMMAND thunderbird-calendar-floating-time-test)
+    set_tests_properties(thunderbird-calendar-floating-time-new-york PROPERTIES
+        ENVIRONMENT "TZ=America/New_York")
+    add_test(NAME thunderbird-calendar-floating-time-tokyo
+        COMMAND thunderbird-calendar-floating-time-test)
+    set_tests_properties(thunderbird-calendar-floating-time-tokyo PROPERTIES
+        ENVIRONMENT "TZ=Asia/Tokyo")
+
+    add_executable(thunderbird-calendar-cache-retry-test tests/cache-retry.cpp)
+    target_link_libraries(thunderbird-calendar-cache-retry-test PRIVATE Qt6::Core)
+    add_test(NAME thunderbird-calendar-cache-retry
+        COMMAND thunderbird-calendar-cache-retry-test)
+
+    add_executable(thunderbird-calendar-visibility-test tests/calendar-visibility.cpp)
+    target_link_libraries(thunderbird-calendar-visibility-test PRIVATE Qt6::Core)
+    add_test(NAME thunderbird-calendar-visibility
+        COMMAND thunderbird-calendar-visibility-test)
+
+    add_executable(thunderbird-calendar-revision-chain-test tests/revision-chain.cpp)
+    target_link_libraries(thunderbird-calendar-revision-chain-test PRIVATE Qt6::Core)
+    add_test(NAME thunderbird-calendar-revision-chain
+        COMMAND thunderbird-calendar-revision-chain-test)
+endif()
 
 add_executable(thunderbird-calendar-native-host src/nativehost.cpp)
 target_link_libraries(thunderbird-calendar-native-host PRIVATE Qt6::Core Qt6::DBus)

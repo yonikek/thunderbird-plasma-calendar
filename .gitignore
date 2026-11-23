@@ -2,7 +2,6 @@ build/
 build-install/
 _install/
 result
-flake.lock
 *.xpi
 *.so
 __pycache__/

@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "name": "Thunderbird Calendar for KDE Plasma",
   "description": "Makes Thunderbird calendar events available to the KDE Plasma Digital Clock calendar.",
-  "version": "0.2.2",
+  "version": "0.9.0",
   "author": "Thunderbird Plasma Calendar contributors",
   "browser_specific_settings": {
     "gecko": {
