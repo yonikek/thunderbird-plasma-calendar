@@ -6,6 +6,7 @@ The test creates its own private D-Bus session with dbus-run-session.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -130,6 +131,28 @@ def queued_diagnostics(lines: "queue.Queue[str]") -> str:
 
 
 
+def snapshot_checkpoint(snapshot_digest: str, revision: str) -> str:
+    payload = (
+        b"thunderbird-plasma-calendar:snapshot-checkpoint:v1\n"
+        + snapshot_digest.encode("ascii") + b"\n" + revision.encode("ascii")
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
+def delta_revision(previous_revision: str, deltas: list[dict]) -> str:
+    """Independent reference implementation of the v2 journal hash chain."""
+    compact_deltas = json.dumps(
+        deltas, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    payload = (
+        b"thunderbird-plasma-calendar:delta-chain:v1\n"
+        + previous_revision.encode("ascii")
+        + b"\n"
+        + compact_deltas
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
 def make_event(uid: str, title: str, start: str = "2026-11-21T09:00:00.000Z",
                end: str = "2026-11-21T10:00:00.000Z") -> dict:
     return {
@@ -170,6 +193,12 @@ def inside_test(host_path: Path) -> int:
     with tempfile.TemporaryDirectory(prefix="tb-calendar-delta-test-") as cache_home:
         env = os.environ.copy()
         env["XDG_CACHE_HOME"] = cache_home
+        # Keep the per-user runtime lock isolated from any real desktop session
+        # while all host processes in this test still share the same lock.
+        runtime_dir = Path(cache_home) / "runtime"
+        runtime_dir.mkdir(mode=0o700)
+        runtime_dir.chmod(0o700)
+        env["XDG_RUNTIME_DIR"] = str(runtime_dir)
         monitor = subprocess.Popen(
             [dbus_monitor, "--session",
              f"type='signal',path='{BUS_PATH}',interface='{BUS_INTERFACE}'"],
@@ -249,6 +278,46 @@ def inside_test(host_path: Path) -> int:
             initial_stored = json.loads(cache_file.read_text(encoding="utf-8"))
             initial_revision = initial_stored["contentRevision"]
             assert response.get("revision") == initial_revision, response
+            assert initial_stored["revisionAlgorithm"] == "delta-chain-v1", initial_stored
+            assert initial_stored["snapshotDigest"] == initial_revision, initial_stored
+            assert initial_stored["revisionCheckpoint"] == snapshot_checkpoint(
+                initial_stored["snapshotDigest"], initial_revision
+            ), initial_stored
+            initial_journal = cache_file.with_name("events.journal").read_text(encoding="utf-8").splitlines()
+            assert len(initial_journal) == 1, initial_journal
+            assert json.loads(initial_journal[0])["schemaVersion"] == 2, initial_journal
+
+            # The native host owns one per-user cache lock. A second Thunderbird
+            # profile/process must be rejected rather than sharing the same
+            # snapshot and revision journal concurrently.
+            competing_host = subprocess.Popen(
+                [str(host_path)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+            )
+            try:
+                competing_response = send_request(competing_host, {
+                    "type": "snapshot", "requestId": "competing-profile", "debugLogs": False,
+                    "snapshot": initial,
+                })
+                assert competing_response.get("ok") is False, competing_response
+                assert competing_response.get("code") == "ACTIVE_PROFILE_LOCKED", competing_response
+            finally:
+                if competing_host.stdin and not competing_host.stdin.closed:
+                    competing_host.stdin.close()
+                competing_host.wait(timeout=5)
+                if competing_host.stdout:
+                    competing_host.stdout.close()
+                if competing_host.stderr:
+                    competing_host.stderr.close()
+            # The original owner must remain usable after rejecting the second host.
+            owner_response = send_request(host, {
+                "type": "snapshot", "requestId": "lock-owner-still-active", "debugLogs": False,
+                "snapshot": initial,
+            })
+            assert owner_response.get("ok") is True, owner_response
 
             updated = make_snapshot([
                 make_event("test-calendar:event-1:", "Modified title"),
@@ -391,6 +460,9 @@ def inside_test(host_path: Path) -> int:
             assert direct_timings["journalRecordCount"] == 1, direct_timings
             assert direct_timings["journalWriteBytes"] > 0, direct_timings
             assert direct_timings["journalCompacted"] is False, direct_timings
+            # Incremental revision calculation hashes only the previous
+            # revision and this small delta batch, not the whole snapshot.
+            assert direct_timings["contentHashMs"] < 100.0, direct_timings
 
             direct_payload = wait_signal(monitor_lines, "EventsDelta")
             if direct_payload is None:
@@ -424,10 +496,15 @@ def inside_test(host_path: Path) -> int:
             assert len(journal_lines) == 2, journal_lines
             journal_header, journal_record = map(json.loads, journal_lines)
             assert journal_header["type"] == "header", journal_header
+            assert journal_header["schemaVersion"] == 2, journal_header
             assert journal_header["baseRevision"] == batches[0]["revision"], journal_header
             assert journal_record["previousRevision"] == batches[0]["revision"], journal_record
+            assert journal_record["schemaVersion"] == 2, journal_record
             assert journal_record["revision"] == direct_revision, journal_record
             assert len(journal_record["deltas"]) == 5, journal_record
+            assert direct_revision == delta_revision(
+                batches[0]["revision"], journal_record["deltas"]
+            ), (direct_revision, journal_record)
 
             # Restarting the host must replay the durable journal over the last
             # compacted snapshot before accepting another direct change.
@@ -443,7 +520,7 @@ def inside_test(host_path: Path) -> int:
             # written. The incomplete, unacknowledged tail must be discarded
             # while all preceding fsync'd records remain replayable.
             with journal_file.open("ab") as journal_stream:
-                journal_stream.write(b'{"type":"delta","schemaVersion":1,"torn":')
+                journal_stream.write(b'{"type":"delta","schemaVersion":2,"torn":')
                 journal_stream.flush()
 
             host = subprocess.Popen(
@@ -488,8 +565,11 @@ def inside_test(host_path: Path) -> int:
             assert original_record["revision"] == direct_revision, original_record
             assert recovery_record["previousRevision"] == direct_revision, recovery_record
             assert recovery_record["revision"] == replay_revision, recovery_record
+            assert replay_revision == delta_revision(
+                direct_revision, recovery_record["deltas"]
+            ), (replay_revision, recovery_record)
             assert recovery_record["type"] == "delta", recovery_record
-            assert recovery_record["schemaVersion"] == 1, recovery_record
+            assert recovery_record["schemaVersion"] == 2, recovery_record
             assert len(recovery_record["deltas"]) == 1, recovery_record
             assert recovery_record["deltas"][0]["operation"] == "modify", recovery_record
             assert recovery_record["deltas"][0]["event"]["uid"] == "test-calendar:direct-new:", recovery_record
@@ -547,7 +627,49 @@ def inside_test(host_path: Path) -> int:
             compacted_journal_lines = journal_file.read_text(encoding="utf-8").splitlines()
             assert len(compacted_journal_lines) == 1, compacted_journal_lines
             compacted_header = json.loads(compacted_journal_lines[0])
+            assert compacted_header["schemaVersion"] == 2, compacted_header
             assert compacted_header["baseRevision"] == compacted_stored["contentRevision"], compacted_header
+            assert compacted_stored["revisionAlgorithm"] == "delta-chain-v1", compacted_stored
+            assert len(compacted_stored["snapshotDigest"]) == 64, compacted_stored
+            assert compacted_stored["revisionCheckpoint"] == snapshot_checkpoint(
+                compacted_stored["snapshotDigest"], compacted_stored["contentRevision"]
+            ), compacted_stored
+
+            # Restart after compaction and append another delta. This verifies
+            # that the compacted snapshot digest anchors the v2 revision chain
+            # and that a new process continues the same revision sequence.
+            host.stdin.close()
+            host.wait(timeout=5)
+            if host_stderr_reader is not None:
+                host_stderr_reader.join(timeout=1)
+            host = subprocess.Popen(
+                [str(host_path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, env=env,
+            )
+            host_stderr_reader = threading.Thread(
+                target=read_binary_lines, args=(host.stderr, host_stderr_lines), daemon=True
+            )
+            host_stderr_reader.start()
+            post_compaction_change = {
+                "operation": "modify", "calendarId": "test-calendar",
+                "event": make_event("test-calendar:direct-new:", "After compacted restart"),
+            }
+            post_compaction_response = send_request(host, {
+                "type": "eventChanges", "requestId": "post-compaction-restart", "debugLogs": True,
+                "changes": [post_compaction_change],
+            })
+            assert post_compaction_response.get("ok") is True, post_compaction_response
+            post_compaction_timing = post_compaction_response.get("hostTimingsMs", {})
+            assert post_compaction_timing.get("journalRecordsReplayed") == 0, post_compaction_timing
+            assert post_compaction_timing.get("contentHashMs", 1e9) < 100.0, post_compaction_timing
+            post_compaction_lines = journal_file.read_text(encoding="utf-8").splitlines()
+            assert len(post_compaction_lines) == 2, post_compaction_lines
+            assert json.loads(post_compaction_lines[0])["schemaVersion"] == 2, post_compaction_lines
+            post_compaction_record = json.loads(post_compaction_lines[1])
+            assert post_compaction_record["schemaVersion"] == 2, post_compaction_record
+            assert post_compaction_response["revision"] == delta_revision(
+                compacted_stored["contentRevision"], post_compaction_record["deltas"]
+            ), post_compaction_record
 
             # If an event arrives for a calendar that is absent from the host's
             # recovery snapshot, the extension must rebuild a full snapshot.
@@ -568,8 +690,194 @@ def inside_test(host_path: Path) -> int:
             if host.returncode != 0:
                 raise AssertionError(f"native host exited with {host.returncode}: "
                                      f"{queued_diagnostics(host_stderr_lines)}")
+
+            # Seed an old v1 snapshot and header, then verify the first direct
+            # update is preceded by a safe full-snapshot migration to v2.
+            legacy_cache_home = Path(cache_home) / "legacy-cache-home"
+            legacy_cache_home.mkdir()
+            legacy_runtime = legacy_cache_home / "runtime"
+            legacy_runtime.mkdir(mode=0o700)
+            legacy_cache_dir = legacy_cache_home / "plasma-thunderbird-calendar"
+            legacy_cache_dir.mkdir(mode=0o700)
+            legacy_snapshot = make_snapshot([make_event("legacy-calendar:event:", "Before upgrade")])
+            digest_input = {
+                key: value for key, value in legacy_snapshot.items()
+                if key not in ("generatedAt", "rangeStart", "rangeEnd", "contentRevision",
+                               "revisionAlgorithm", "snapshotDigest")
+            }
+            legacy_revision = hashlib.sha256(json.dumps(
+                digest_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")).hexdigest()
+            legacy_snapshot["contentRevision"] = legacy_revision
+            (legacy_cache_dir / "events.json").write_text(
+                json.dumps(legacy_snapshot, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+            )
+            (legacy_cache_dir / "events.journal").write_text(
+                json.dumps({"type": "header", "schemaVersion": 1, "baseRevision": legacy_revision},
+                           sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            legacy_env = env.copy()
+            legacy_env["XDG_CACHE_HOME"] = str(legacy_cache_home)
+            legacy_env["XDG_RUNTIME_DIR"] = str(legacy_runtime)
+            legacy_host = subprocess.Popen(
+                [str(host_path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, env=legacy_env,
+            )
+            legacy_stderr = queue.Queue()
+            legacy_reader = threading.Thread(
+                target=read_binary_lines, args=(legacy_host.stderr, legacy_stderr), daemon=True
+            )
+            legacy_reader.start()
+            legacy_response = send_request(legacy_host, {
+                "type": "eventChanges", "requestId": "legacy-v1-migration", "debugLogs": True,
+                "changes": [{
+                    "operation": "modify", "calendarId": "test-calendar",
+                    "event": make_event("legacy-calendar:event:", "After upgrade"),
+                }],
+            })
+            assert legacy_response.get("ok") is True, legacy_response
+            legacy_journal_lines = (legacy_cache_dir / "events.journal").read_text(encoding="utf-8").splitlines()
+            assert len(legacy_journal_lines) == 2, legacy_journal_lines
+            migrated_header, migrated_record = map(json.loads, legacy_journal_lines)
+            assert migrated_header["schemaVersion"] == 2, migrated_header
+            assert migrated_header["baseRevision"] == legacy_revision, migrated_header
+            assert migrated_record["schemaVersion"] == 2, migrated_record
+            migrated_snapshot = json.loads((legacy_cache_dir / "events.json").read_text(encoding="utf-8"))
+            assert migrated_snapshot["revisionAlgorithm"] == "delta-chain-v1", migrated_snapshot
+            assert migrated_snapshot["snapshotDigest"] == legacy_revision, migrated_snapshot
+            assert migrated_snapshot["revisionCheckpoint"] == snapshot_checkpoint(
+                migrated_snapshot["snapshotDigest"], migrated_snapshot["contentRevision"]
+            ), migrated_snapshot
+            legacy_host.stdin.close()
+            legacy_host.wait(timeout=5)
+            if legacy_host.returncode != 0:
+                raise AssertionError(f"legacy migration host exited with {legacy_host.returncode}: "
+                                     f"{queued_diagnostics(legacy_stderr)}")
+
+            # The snapshot checkpoint binds the content digest to the current
+            # chain tip after compaction. Corrupting only the chain-tip metadata
+            # must fail recovery rather than silently discarding acknowledged
+            # journal records and continuing from an unverified revision.
+            tampered_snapshot = json.loads(
+                (legacy_cache_dir / "events.json").read_text(encoding="utf-8")
+            )
+            tampered_snapshot["contentRevision"] = "0" * 64
+            (legacy_cache_dir / "events.json").write_text(
+                json.dumps(tampered_snapshot, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            corrupt_host = subprocess.Popen(
+                [str(host_path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, env=legacy_env,
+            )
+            corrupt_stderr = queue.Queue()
+            corrupt_reader = threading.Thread(
+                target=read_binary_lines, args=(corrupt_host.stderr, corrupt_stderr), daemon=True
+            )
+            corrupt_reader.start()
+            try:
+                corrupt_response = send_request(corrupt_host, {
+                    "type": "eventChanges", "requestId": "corrupt-revision-checkpoint",
+                    "debugLogs": False, "changes": [{
+                        "operation": "modify", "calendarId": "test-calendar",
+                        "event": make_event("legacy-calendar:event:", "Must not be applied"),
+                    }],
+                })
+                assert corrupt_response.get("ok") is False, corrupt_response
+                assert corrupt_response.get("code") == "FULL_SNAPSHOT_REQUIRED", corrupt_response
+            finally:
+                if corrupt_host.stdin and not corrupt_host.stdin.closed:
+                    corrupt_host.stdin.close()
+                corrupt_host.wait(timeout=5)
+                if corrupt_host.returncode != 0:
+                    raise AssertionError(
+                        f"corrupt-checkpoint host exited with {corrupt_host.returncode}: "
+                        f"{queued_diagnostics(corrupt_stderr)}"
+                    )
+
+            # Use a realistic large cache to ensure the direct-update hash
+            # timing is independent of the full snapshot size. This is close
+            # to the user's 50k-event / ~21 MiB calendar and would fail the old
+            # implementation, which serialised and hashed the complete snapshot
+            # for each individual event update.
+            perf_cache_home = Path(cache_home) / "perf-cache-home"
+            perf_cache_home.mkdir()
+            perf_runtime = perf_cache_home / "runtime"
+            perf_runtime.mkdir(mode=0o700)
+            perf_env = env.copy()
+            perf_env["XDG_CACHE_HOME"] = str(perf_cache_home)
+            perf_env["XDG_RUNTIME_DIR"] = str(perf_runtime)
+            perf_host = subprocess.Popen(
+                [str(host_path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, env=perf_env,
+            )
+            perf_stderr = queue.Queue()
+            perf_reader = threading.Thread(
+                target=read_binary_lines, args=(perf_host.stderr, perf_stderr), daemon=True
+            )
+            perf_reader.start()
+            try:
+                perf_events = []
+                perf_description = "Large-calendar hash regression fixture. " * 5
+                for index in range(50000):
+                    event = make_event(
+                        f"test-calendar:perf-{index:05d}:",
+                        f"Performance fixture event {index}",
+                    )
+                    event["description"] = perf_description
+                    perf_events.append(event)
+                large_snapshot = make_snapshot(perf_events)
+                large_frame_size = len(json.dumps(large_snapshot, separators=(",", ":")).encode("utf-8"))
+                assert large_frame_size < 28 * 1024 * 1024, large_frame_size
+                large_snapshot_response = send_request(perf_host, {
+                    "type": "snapshot", "requestId": "large-hash-fixture",
+                    "debugLogs": False, "snapshot": large_snapshot,
+                })
+                assert large_snapshot_response.get("ok") is True, large_snapshot_response
+                perf_snapshot_file = (
+                    perf_cache_home / "plasma-thunderbird-calendar" / "events.json"
+                )
+                large_stored = json.loads(perf_snapshot_file.read_text(encoding="utf-8"))
+                large_anchor = large_stored["contentRevision"]
+                perf_update = make_event(
+                    "test-calendar:perf-25000:", "Updated performance fixture event"
+                )
+                perf_update["description"] = "Updated description"
+                perf_response = send_request(perf_host, {
+                    "type": "eventChanges", "requestId": "large-snapshot-one-event-update",
+                    "debugLogs": True, "changes": [{
+                        "operation": "modify", "calendarId": "test-calendar",
+                        "event": perf_update,
+                    }],
+                })
+                assert perf_response.get("ok") is True, perf_response
+                perf_timings = perf_response.get("hostTimingsMs", {})
+                assert perf_timings.get("directChangeCount") == 1, perf_timings
+                assert perf_timings.get("eventDeltaCount") == 1, perf_timings
+                assert perf_timings.get("contentHashMs", 1e9) < 10.0, (
+                    f"revision hashing scaled with a {large_frame_size / (1024 * 1024):.1f} MiB "
+                    f"snapshot: {perf_timings}"
+                )
+                perf_journal = perf_snapshot_file.with_name("events.journal")
+                perf_lines = perf_journal.read_text(encoding="utf-8").splitlines()
+                assert len(perf_lines) == 2, perf_lines
+                perf_record = json.loads(perf_lines[1])
+                assert perf_record["revision"] == delta_revision(
+                    large_anchor, perf_record["deltas"]
+                ), perf_record
+            finally:
+                if perf_host.stdin and not perf_host.stdin.closed:
+                    perf_host.stdin.close()
+                perf_host.wait(timeout=10)
+                if perf_host.returncode != 0:
+                    raise AssertionError(
+                        f"large-cache performance host exited with {perf_host.returncode}: "
+                        f"{queued_diagnostics(perf_stderr)}"
+                    )
             print("Native-host event-delta integration test passed:")
             print("- Initial snapshot emitted EventsChanged")
+            print("- A competing native-host process was rejected by the single-profile lock")
             print("- One modify, three additions and one removal emitted through EventsDelta")
             print("- Multiple direct additions replayed in deterministic event order")
             print("- Metadata-only change emitted an empty revision-advancing batch")
@@ -580,6 +888,11 @@ def inside_test(host_path: Path) -> int:
             print("- Incomplete journal tail was discarded before the post-recovery update was appended as a second valid record")
             print("- Matching full snapshots were recognised as unchanged after journal replay")
             print("- 128 direct update records triggered atomic snapshot compaction and journal reset")
+            print("- Version-2 incremental revision chains survived compaction and process restart")
+            print("- Legacy version-1 journals were migrated before the next direct update")
+            print("- Corrupted post-compaction revision checkpoints requested a full snapshot")
+            print("- Direct updates on a 50,000-event / ~21 MiB snapshot used bounded delta-only hash time")
+            print("- Independent Python reference hashing matched revisions written by the native host")
             print("- Direct-update timings cover journal serialisation, append, fsync and compaction")
             print("- Date-moving modification preserved old and new start dates in the delta")
             print("- Both raw-quoted and escaped dbus-monitor string formats decoded correctly")

@@ -18,13 +18,65 @@ var tbCalendarBridge = (() => {
   const CHUNK_DAYS = 30;
   const MAX_CONCURRENT_CALENDARS = 3;
   const DEFAULT_QUERY_TIMEOUT_SECONDS = 60;
-  const MAX_OBSERVER_OCCURRENCES = 100000;
-  const MAX_BATCHED_OBSERVER_CHANGES = 5000;
+  // Direct observer messages are deliberately much smaller than the native
+  // messaging frame limit. Larger recurrence edits must use a full snapshot.
+  const MAX_DIRECT_OBSERVER_CHANGES = 5000;
   const RECENT_ITEM_LOAD_SUPPRESSION_MS = 5000;
   const WATCHED_PROPERTIES = new Set(["name", "color", "disabled"]);
 
   let debugLogsEnabled = false;
   let liveObserverConfig = null;
+
+  // Snapshot reads and provider batches share a lightweight generation guard.
+  // A read that overlaps a batch is never cached as a complete calendar view;
+  // after the batch closes, a full refresh is requested to repair any partial
+  // result. This is deliberately metadata-only, not another event collection.
+  const activeCalendarBatchDepth = new Map();
+  let activeGlobalBatchDepth = 0;
+  const snapshotReads = new Set();
+  const snapshotBatchConflicts = new Set();
+
+  function isCalendarBatchActive(calendarId) {
+    return activeGlobalBatchDepth > 0 || (activeCalendarBatchDepth.get(calendarId) || 0) > 0;
+  }
+
+  function beginTrackedBatch(calendar) {
+    const id = calendarIdOf(calendar);
+    if (id === null) {
+      activeGlobalBatchDepth++;
+      for (const readingId of snapshotReads) {
+        snapshotBatchConflicts.add(readingId);
+      }
+      return;
+    }
+    activeCalendarBatchDepth.set(id, (activeCalendarBatchDepth.get(id) || 0) + 1);
+    if (snapshotReads.has(id) || activeGlobalBatchDepth > 0) {
+      snapshotBatchConflicts.add(id);
+    }
+  }
+
+  function endTrackedBatch(calendar) {
+    const id = calendarIdOf(calendar);
+    if (id === null) {
+      activeGlobalBatchDepth = Math.max(0, activeGlobalBatchDepth - 1);
+    } else {
+      const depth = activeCalendarBatchDepth.get(id) || 0;
+      if (depth <= 1) {
+        activeCalendarBatchDepth.delete(id);
+      } else {
+        activeCalendarBatchDepth.set(id, depth - 1);
+      }
+    }
+
+    let refreshNeeded = false;
+    for (const conflictId of Array.from(snapshotBatchConflicts)) {
+      if (!isCalendarBatchActive(conflictId)) {
+        snapshotBatchConflicts.delete(conflictId);
+        refreshNeeded = true;
+      }
+    }
+    return refreshNeeded;
+  }
 
   function debugError(...args) {
     if (debugLogsEnabled) {
@@ -95,14 +147,43 @@ var tbCalendarBridge = (() => {
     return String(value).padStart(2, "0");
   }
 
+  function isFloatingDateTime(dateTime) {
+    try {
+      const timezone = dateTime && dateTime.timezone;
+      return Boolean(timezone && (timezone.isFloating === true || timezone.tzid === "floating"));
+    } catch (error) {
+      return false;
+    }
+  }
+
   function serializeDateTime(dateTime) {
     if (!dateTime) {
       return null;
     }
     if (dateTime.isDate) {
-      return `${dateTime.year}-${pad2(dateTime.month + 1)}-${pad2(dateTime.day)}`;
+      return {
+        value: `${dateTime.year}-${pad2(dateTime.month + 1)}-${pad2(dateTime.day)}`,
+        floating: false
+      };
     }
-    return cal.dtz.dateTimeToJsDate(dateTime.getInTimezone(cal.dtz.UTC)).toISOString();
+    if (isFloatingDateTime(dateTime)) {
+      // A floating iCalendar DATE-TIME is a wall-clock value, not an instant.
+      // getInTimezone(UTC) does not convert it; dateTimeToJsDate() then
+      // interprets its fields using JavaScript Date semantics and can attach
+      // the wrong offset. Preserve the fields and explicitly mark the value
+      // so Plasma parses it as local time instead of UTC.
+      const milliseconds = Number(dateTime.millisecond) || 0;
+      const fraction = milliseconds === 0 ? "" : `.${String(milliseconds).padStart(3, "0")}`;
+      return {
+        value: `${dateTime.year}-${pad2(dateTime.month + 1)}-${pad2(dateTime.day)}` +
+          `T${pad2(dateTime.hour)}:${pad2(dateTime.minute)}:${pad2(dateTime.second)}${fraction}`,
+        floating: true
+      };
+    }
+    return {
+      value: cal.dtz.dateTimeToJsDate(dateTime.getInTimezone(cal.dtz.UTC)).toISOString(),
+      floating: false
+    };
   }
 
   function calendarColour(calendar) {
@@ -199,13 +280,21 @@ var tbCalendarBridge = (() => {
       // Item-level colours are optional.
     }
 
+    const serializedStart = serializeDateTime(start);
+    const serializedEnd = serializeDateTime(end);
+    if (!serializedStart || !serializedEnd) {
+      return null;
+    }
+
     return {
       uid: `${calendarId}:${item.id || "unknown"}:${recurrence}`,
       title: item.title || "(untitled)",
       description,
       location,
-      start: serializeDateTime(start),
-      end: serializeDateTime(end),
+      start: serializedStart.value,
+      end: serializedEnd.value,
+      startFloating: serializedStart.floating,
+      endFloating: serializedEnd.floating,
       allDay: Boolean(start.isDate),
       kind: isTodo ? "todo" : "event",
       color: itemColor || calendarColor
@@ -306,15 +395,21 @@ var tbCalendarBridge = (() => {
     }
     const recurrenceInfo = item.recurrenceInfo;
     if (recurrenceInfo) {
+      // Ask Thunderbird for only one more than the direct-message budget. The
+      // extra occurrence is a sentinel: seeing it proves that the complete
+      // series cannot be delivered incrementally. This bounds expansion and
+      // serialisation work instead of materialising up to 100,000 occurrences
+      // only to reject the resulting message later.
+      const occurrenceLimit = MAX_DIRECT_OBSERVER_CHANGES + 1;
       const occurrences = recurrenceInfo.getOccurrences(
         cloneDateTime(liveObserverConfig.rangeStart),
         cloneDateTime(liveObserverConfig.rangeEnd),
-        MAX_OBSERVER_OCCURRENCES
+        occurrenceLimit
       );
-      // Reaching the cap may mean the observer change represents more
-      // instances than this direct protocol can safely enqueue. Fall back to
-      // the normal full-snapshot path rather than silently omitting instances.
-      if (occurrences.length >= MAX_OBSERVER_OCCURRENCES) {
+      // Reaching the sentinel may mean additional occurrences were truncated;
+      // use the authoritative full-snapshot path rather than silently omitting
+      // any part of the recurring series.
+      if (occurrences.length >= occurrenceLimit) {
         return null;
       }
       return occurrences.filter(itemOverlapsLiveRange);
@@ -373,6 +468,13 @@ var tbCalendarBridge = (() => {
     const previous = serializeObservedItems(oldItem);
     const current = serializeObservedItems(newItem);
     if (previous === null || current === null) {
+      return null;
+    }
+    // A modification may require serialising both the old and new recurrence
+    // sets. Bound their combined size before building maps or a diff array; a
+    // pair of individually acceptable series can still exceed the protocol
+    // budget when considered together.
+    if (previous.length + current.length > MAX_DIRECT_OBSERVER_CHANGES) {
       return null;
     }
     const previousByKey = new Map(previous.map(value => [`${value.calendarId}\u0000${value.event.uid}`, value]));
@@ -446,12 +548,48 @@ var tbCalendarBridge = (() => {
     };
 
     const itemChanged = (operation, newItem, oldItem) => {
-      const calendar = itemCalendar(newItem || oldItem);
-      const calendarId = calendarIdOf(calendar);
-      if (batchDepth > 0) {
-        invalidateDuringBatch(calendar);
-      } else {
-        invalidateCalendar(calendar);
+      // Thunderbird can report a move between calendars through one
+      // onModifyItem(newItem, oldItem) callback. Invalidate both sides: the old
+      // calendar's cached copy must not be reused by the next full snapshot.
+      const affectedCalendars = [];
+      const seenCalendarIds = new Set();
+      for (const item of [oldItem, newItem]) {
+        if (!item) {
+          continue;
+        }
+        const calendar = itemCalendar(item);
+        const id = calendarIdOf(calendar);
+        if (id === null) {
+          if (calendar === null && !seenCalendarIds.has("<unknown>")) {
+            seenCalendarIds.add("<unknown>");
+            affectedCalendars.push({ calendar: null, id: null });
+          }
+          continue;
+        }
+        if (!seenCalendarIds.has(id)) {
+          seenCalendarIds.add(id);
+          affectedCalendars.push({ calendar, id });
+        }
+      }
+
+      if (affectedCalendars.length === 0) {
+        affectedCalendars.push({ calendar: null, id: null });
+      }
+      for (const affected of affectedCalendars) {
+        if (batchDepth > 0) {
+          invalidateDuringBatch(affected.calendar);
+        } else {
+          invalidateCalendar(affected.calendar);
+        }
+      }
+
+      // Once a provider batch has overflowed, the full snapshot is the only
+      // authoritative result. Continue invalidating affected calendars, but
+      // do not expand or serialise more recurrence instances from this batch.
+      if (batchDepth > 0 && batchOverflow) {
+        batchHadItemChanges = true;
+        batchNeedsRefresh = true;
+        return;
       }
 
       let changes;
@@ -463,6 +601,11 @@ var tbCalendarBridge = (() => {
       }
       if (changes === null) {
         if (batchDepth > 0) {
+          // A partially serialisable batch cannot be safely applied as deltas.
+          // Discard any queued prefix and recover from the complete snapshot.
+          batchHadItemChanges = true;
+          batchChanges.length = 0;
+          batchOverflow = true;
           batchNeedsRefresh = true;
         } else {
           notify();
@@ -472,17 +615,45 @@ var tbCalendarBridge = (() => {
       if (changes.length === 0) {
         return;
       }
-      markRecentItemChange(calendar);
+
+      // Check a single observer callback before retaining or forwarding its
+      // occurrence list. A large recurring master can expand to thousands of
+      // concrete changes even outside a provider batch.
+      if (changes.length > MAX_DIRECT_OBSERVER_CHANGES) {
+        if (batchDepth > 0) {
+          batchHadItemChanges = true;
+          batchChanges.length = 0;
+          batchOverflow = true;
+          batchNeedsRefresh = true;
+        }
+        debugInfo("calendar observer change exceeded the direct-update limit; falling back to a snapshot refresh",
+          changes.length);
+        if (batchDepth === 0) {
+          notify();
+        }
+        return;
+      }
+
+      for (const affected of affectedCalendars) {
+        if (affected.id !== null) {
+          markRecentItemChange({ id: affected.id });
+        }
+      }
       if (batchDepth > 0) {
         batchHadItemChanges = true;
         if (!batchOverflow) {
-          batchChanges.push(...changes);
-          if (batchChanges.length > MAX_BATCHED_OBSERVER_CHANGES) {
+          if (batchChanges.length + changes.length > MAX_DIRECT_OBSERVER_CHANGES) {
             batchChanges.length = 0;
             batchOverflow = true;
             batchNeedsRefresh = true;
             debugInfo("calendar batch exceeded the direct-update limit; falling back to a snapshot refresh",
-              calendarId || "unknown calendar");
+              affectedCalendars.map(value => value.id || "unknown calendar").join(", "));
+          } else {
+            // Avoid argument spreading even for bounded batches. A loop also
+            // makes this path independent of the engine's argument-count cap.
+            for (const change of changes) {
+              batchChanges.push(change);
+            }
           }
         }
       } else {
@@ -493,12 +664,17 @@ var tbCalendarBridge = (() => {
     const calendarObserver = {
       QueryInterface: ChromeUtils.generateQI(["calIObserver"]),
       onStartBatch(calendar) {
+        beginTrackedBatch(calendar);
         batchDepth++;
         invalidateDuringBatch(calendar);
       },
       onEndBatch(calendar) {
+        const snapshotConflictResolved = endTrackedBatch(calendar);
         if (batchDepth <= 0) {
           changed(calendar);
+          if (snapshotConflictResolved) {
+            notify();
+          }
           return;
         }
         batchDepth--;
@@ -506,7 +682,7 @@ var tbCalendarBridge = (() => {
           if (batchHadItemChanges && !batchOverflow && batchChanges.length > 0) {
             notifyItemChanges(batchChanges.splice(0));
           }
-          if (batchNeedsRefresh || batchOverflow) {
+          if (batchNeedsRefresh || batchOverflow || snapshotConflictResolved) {
             notify();
           }
           for (const id of batchCalendarIds) {
@@ -519,6 +695,8 @@ var tbCalendarBridge = (() => {
           batchInvalidated.clear();
           batchCalendarIds.clear();
           batchGlobalInvalidated = false;
+        } else if (snapshotConflictResolved) {
+          notify();
         }
       },
       onLoad(calendar) {
@@ -832,6 +1010,15 @@ var tbCalendarBridge = (() => {
                 const previous = cache.get(id);
 
                 try {
+                  if (isCalendarBatchActive(id)) {
+                    snapshotBatchConflicts.add(id);
+                    timing.stale++;
+                    const stale = staleEntry(current, previous && previous.key === key ? previous : null,
+                      "Snapshot deferred because the calendar provider is inside a batch operation.");
+                    stale.retryable = false;
+                    return stale;
+                  }
+
                   if (calendar.getProperty("disabled") === true) {
                     current.status = "disabled";
                     cache.set(id, { key, version: versionBefore, entry: current });
@@ -845,15 +1032,20 @@ var tbCalendarBridge = (() => {
 
                   timing.read++;
                   const seen = new Set();
-                  for (const [from, to] of chunks) {
-                    if (yielder.shouldYield()) {
-                      await yielder.yieldNow();
+                  snapshotReads.add(id);
+                  try {
+                    for (const [from, to] of chunks) {
+                      if (yielder.shouldYield()) {
+                        await yielder.yieldNow();
+                      }
+                      timing.queries++;
+                      await readChunk(
+                        calendar, from, to, current, exportOptions, seen,
+                        yielder, timing, logTiming, timeoutMs
+                      );
                     }
-                    timing.queries++;
-                    await readChunk(
-                      calendar, from, to, current, exportOptions, seen,
-                      yielder, timing, logTiming, timeoutMs
-                    );
+                  } finally {
+                    snapshotReads.delete(id);
                   }
 
                   if (versionOf(id) !== versionBefore) {

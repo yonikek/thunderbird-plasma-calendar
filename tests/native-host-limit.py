@@ -6,9 +6,12 @@ Usage: python3 tests/native-host-limit.py /path/to/thunderbird-calendar-native-h
 from __future__ import annotations
 
 import json
+import os
 import struct
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 MAX_BYTES = 32 * 1024 * 1024
 TEST_BYTES = MAX_BYTES + 1
@@ -21,9 +24,17 @@ def main() -> int:
 
     host = sys.argv[1]
     frame = struct.pack("<I", TEST_BYTES) + (b"x" * TEST_BYTES)
-    completed = subprocess.run(
-        [host], input=frame, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
-    )
+    with tempfile.TemporaryDirectory(prefix="tb-calendar-limit-test-") as cache_home:
+        env = os.environ.copy()
+        env["XDG_CACHE_HOME"] = cache_home
+        runtime_dir = Path(cache_home) / "runtime"
+        runtime_dir.mkdir(mode=0o700)
+        runtime_dir.chmod(0o700)
+        env["XDG_RUNTIME_DIR"] = str(runtime_dir)
+        completed = subprocess.run(
+            [host], input=frame, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=env, check=False
+        )
     if completed.returncode != 0:
         print(completed.stderr.decode("utf-8", errors="replace"), file=sys.stderr)
         raise SystemExit(f"native host exited unexpectedly with status {completed.returncode}")

@@ -9,6 +9,8 @@ class CalendarConfigModel : public QAbstractListModel
 {
     Q_OBJECT
     QML_ELEMENT
+    Q_PROPERTY(int count READ count NOTIFY countChanged)
+    Q_PROPERTY(bool showStaleEvents READ showStaleEvents WRITE setShowStaleEvents NOTIFY showStaleEventsChanged)
 
 public:
     enum Roles {
@@ -22,13 +24,15 @@ public:
     int count() const;
     QVariant data(const QModelIndex &index, int role = Qt::DisplayRole) const override;
     QHash<int, QByteArray> roleNames() const override;
-    Q_PROPERTY(int count READ count NOTIFY countChanged)
+    bool showStaleEvents() const;
+    void setShowStaleEvents(bool show);
     Q_INVOKABLE void setEnabled(const QString &calendarId, bool enabled);
     Q_INVOKABLE void saveConfig();
     Q_INVOKABLE void reload();
 
 Q_SIGNALS:
     void countChanged();
+    void showStaleEventsChanged();
 
 private:
     struct Calendar {
@@ -37,4 +41,5 @@ private:
         bool checked = true;
     };
     QVector<Calendar> m_calendars;
+    bool m_showStaleEvents = true;
 };

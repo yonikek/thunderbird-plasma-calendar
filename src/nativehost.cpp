@@ -6,6 +6,8 @@
  * checksummed journal and fsync'd before D-Bus delivery. The complete recovery
  * snapshot is atomically compacted periodically, keeping routine updates small.
  */
+#include "revisionutils.h"
+
 #include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -20,6 +22,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QLockFile>
 #include <QSaveFile>
 #include <QSet>
 #include <QStringList>
@@ -51,6 +54,24 @@ QString cacheDirectory()
 {
     return QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation)
         + QStringLiteral("/plasma-thunderbird-calendar");
+}
+
+QStringList profileLockDirectoryCandidates()
+{
+    QStringList candidates;
+    const QString runtimeDirectory = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
+    if (!runtimeDirectory.isEmpty()) {
+        candidates.append(runtimeDirectory + QStringLiteral("/plasma-thunderbird-calendar"));
+    }
+    const QString configDirectory = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation);
+    if (!configDirectory.isEmpty()) {
+        candidates.append(configDirectory + QStringLiteral("/plasma-thunderbird-calendar"));
+    }
+    // Last-resort fallback for unusual headless environments where neither a
+    // runtime nor a config location is available.
+    candidates.append(cacheDirectory());
+    candidates.removeDuplicates();
+    return candidates;
 }
 
 QString formatMiB(quint32 bytes)
@@ -305,16 +326,12 @@ void notifyEventDeltas(const QJsonArray &deltas, const QString &previousRevision
     QCoreApplication::processEvents();
 }
 
-// Digest of a snapshot's calendar content. generatedAt and the query range are
-// regenerated on every refresh, so they are excluded; QJsonObject keeps its
-// keys sorted, which makes the compact serialisation deterministic.
+// Full digest of snapshot content, used to anchor a new revision chain and
+// verify compacted snapshots. Volatile range/generation data and revision
+// metadata are excluded by the shared helper; QJsonObject serialisation is deterministic.
 QByteArray contentDigest(QJsonObject snapshot)
 {
-    snapshot.remove(QStringLiteral("generatedAt"));
-    snapshot.remove(QStringLiteral("rangeStart"));
-    snapshot.remove(QStringLiteral("rangeEnd"));
-    snapshot.remove(QStringLiteral("contentRevision"));
-    return QCryptographicHash::hash(QJsonDocument(snapshot).toJson(QJsonDocument::Compact), QCryptographicHash::Sha256);
+    return ThunderbirdCalendar::snapshotContentDigest(std::move(snapshot));
 }
 
 bool readSnapshotFile(const QString &path, QJsonObject *snapshot)
@@ -409,7 +426,7 @@ QJsonArray eventDeltas(QHash<QString, IndexedEvent> &previous, const QJsonObject
     return deltas;
 }
 
-QByteArray lastWrittenDigest;
+QByteArray lastWrittenRevision;
 QJsonObject cachedSnapshot;
 bool hasCachedSnapshot = false;
 
@@ -426,6 +443,7 @@ QString journalCachePath()
 qint64 journalRecordCount = 0;
 qint64 journalBytes = 0;
 bool journalReady = false;
+int journalSchemaVersion = ThunderbirdCalendar::DeltaJournalSchemaVersion;
 
 constexpr qint64 CompactJournalAfterRecords = 128;
 constexpr qint64 CompactJournalAfterBytes = 1024 * 1024;
@@ -468,19 +486,22 @@ bool writeAtomicFile(const QString &path, const QByteArray &data, QString *error
     return syncParentDirectory(path, error);
 }
 
-QByteArray journalHeaderLine(const QString &baseRevision)
+QByteArray journalHeaderLine(const QString &baseRevision, int schemaVersion)
 {
     const QJsonObject header{
         {QStringLiteral("type"), QStringLiteral("header")},
-        {QStringLiteral("schemaVersion"), 1},
+        {QStringLiteral("schemaVersion"), schemaVersion},
         {QStringLiteral("baseRevision"), baseRevision},
     };
     return QJsonDocument(header).toJson(QJsonDocument::Compact) + '\n';
 }
 
-bool resetJournal(const QString &path, const QString &baseRevision, QString *error)
+bool resetJournal(const QString &path,
+                  const QString &baseRevision,
+                  QString *error,
+                  int schemaVersion = ThunderbirdCalendar::DeltaJournalSchemaVersion)
 {
-    const QByteArray header = journalHeaderLine(baseRevision);
+    const QByteArray header = journalHeaderLine(baseRevision, schemaVersion);
     if (!writeAtomicFile(path, header, error)) {
         journalReady = false;
         return false;
@@ -488,6 +509,7 @@ bool resetJournal(const QString &path, const QString &baseRevision, QString *err
     journalRecordCount = 0;
     journalBytes = header.size();
     journalReady = true;
+    journalSchemaVersion = schemaVersion;
     return true;
 }
 
@@ -763,13 +785,24 @@ bool loadRecoveryState(const QString &cachePath,
 
     phase.restart();
     const QString storedBaseRevision = snapshot->value(QStringLiteral("contentRevision")).toString();
-    const QString baseRevision = QString::fromLatin1(contentDigest(*snapshot).toHex());
+    const QString baseContentDigest = QString::fromLatin1(contentDigest(*snapshot).toHex());
     timings->contentHashMs += phase.nsecsElapsed() / 1000000.0;
-    if (!storedBaseRevision.isEmpty() && storedBaseRevision != baseRevision) {
-        *error = QStringLiteral("recovery snapshot content does not match its stored revision");
-        return false;
+    const bool chainSnapshot = ThunderbirdCalendar::usesDeltaRevisionChain(*snapshot);
+    QString baseRevision = storedBaseRevision;
+    if (chainSnapshot) {
+        if (storedBaseRevision.isEmpty()
+            || !ThunderbirdCalendar::snapshotRevisionCheckpointMatches(*snapshot, baseContentDigest)) {
+            *error = QStringLiteral("recovery snapshot content or revision checkpoint is invalid");
+            return false;
+        }
+    } else {
+        if (!storedBaseRevision.isEmpty() && storedBaseRevision != baseContentDigest) {
+            *error = QStringLiteral("recovery snapshot content does not match its stored revision");
+            return false;
+        }
+        baseRevision = baseContentDigest;
+        snapshot->insert(QStringLiteral("contentRevision"), baseRevision);
     }
-    snapshot->insert(QStringLiteral("contentRevision"), baseRevision);
     QElapsedTimer journalTimer;
     journalTimer.start();
 
@@ -781,7 +814,7 @@ bool loadRecoveryState(const QString &cachePath,
             return false;
         }
         snapshot->insert(QStringLiteral("contentRevision"), baseRevision);
-        lastWrittenDigest = QByteArray::fromHex(baseRevision.toLatin1());
+        lastWrittenRevision = QByteArray::fromHex(baseRevision.toLatin1());
         timings->journalFileBytes = journalBytes;
         timings->journalReplayMs += journalTimer.nsecsElapsed() / 1000000.0;
         return true;
@@ -818,7 +851,9 @@ bool loadRecoveryState(const QString &cachePath,
     }
     const QJsonObject header = headerDocument.object();
     if (header.value(QStringLiteral("type")).toString() != QStringLiteral("header")
-        || header.value(QStringLiteral("schemaVersion")).toInt(-1) != 1
+        || (header.value(QStringLiteral("schemaVersion")).toInt(-1) != 1
+            && header.value(QStringLiteral("schemaVersion")).toInt(-1)
+                != ThunderbirdCalendar::DeltaJournalSchemaVersion)
         || !header.value(QStringLiteral("baseRevision")).isString()) {
         timings->journalReplayMs += journalTimer.nsecsElapsed() / 1000000.0;
         *error = QStringLiteral("recovery journal header has an unsupported schema");
@@ -828,7 +863,9 @@ bool loadRecoveryState(const QString &cachePath,
     // A snapshot is atomically committed before a journal is reset. If a crash
     // occurs between those operations, its revision no longer matches the old
     // journal header. The snapshot therefore supersedes that entire old journal.
-    if (header.value(QStringLiteral("baseRevision")).toString() != baseRevision) {
+    const int headerSchemaVersion = header.value(QStringLiteral("schemaVersion")).toInt();
+    if (header.value(QStringLiteral("baseRevision")).toString() != baseRevision
+        || (chainSnapshot && headerSchemaVersion != ThunderbirdCalendar::DeltaJournalSchemaVersion)) {
         QString journalError;
         if (!resetJournal(journalPath, baseRevision, &journalError)) {
             timings->journalReplayMs += journalTimer.nsecsElapsed() / 1000000.0;
@@ -836,7 +873,7 @@ bool loadRecoveryState(const QString &cachePath,
             return false;
         }
         snapshot->insert(QStringLiteral("contentRevision"), baseRevision);
-        lastWrittenDigest = QByteArray::fromHex(baseRevision.toLatin1());
+        lastWrittenRevision = QByteArray::fromHex(baseRevision.toLatin1());
         timings->journalFileBytes = journalBytes;
         timings->journalReplayMs += journalTimer.nsecsElapsed() / 1000000.0;
         return true;
@@ -871,13 +908,22 @@ bool loadRecoveryState(const QString &cachePath,
         const QString previousRevision = record.value(QStringLiteral("previousRevision")).toString();
         const QJsonValue deltasValue = record.value(QStringLiteral("deltas"));
         if (record.value(QStringLiteral("type")).toString() != QStringLiteral("delta")
-            || record.value(QStringLiteral("schemaVersion")).toInt(-1) != 1
+            || record.value(QStringLiteral("schemaVersion")).toInt(-1) != headerSchemaVersion
             || previousRevision != currentRevision || recordRevision.isEmpty()
             || !deltasValue.isArray()
             || record.value(QStringLiteral("checksum")).toString().toLatin1() != journalRecordChecksum(record)) {
             timings->journalReplayMs += journalTimer.nsecsElapsed() / 1000000.0;
             *error = QStringLiteral("recovery journal chain or checksum is invalid at byte %1").arg(offset);
             return false;
+        }
+        if (headerSchemaVersion == ThunderbirdCalendar::DeltaJournalSchemaVersion) {
+            const QString expectedRevision = ThunderbirdCalendar::nextDeltaRevision(
+                currentRevision, deltasValue.toArray());
+            if (recordRevision != expectedRevision) {
+                timings->journalReplayMs += journalTimer.nsecsElapsed() / 1000000.0;
+                *error = QStringLiteral("recovery journal delta revision is invalid at byte %1").arg(offset);
+                return false;
+            }
         }
         QString applyError;
         if (!applyJournalDeltas(snapshot, deltasValue.toArray(), &applyError)) {
@@ -896,23 +942,35 @@ bool loadRecoveryState(const QString &cachePath,
         offset = validBytes;
     }
 
-    QElapsedTimer hashTimer;
-    hashTimer.start();
-    const QString recoveredDigest = QString::fromLatin1(contentDigest(*snapshot).toHex());
-    timings->contentHashMs += hashTimer.nsecsElapsed() / 1000000.0;
-    if (recoveredDigest != currentRevision) {
-        timings->journalReplayMs += journalTimer.nsecsElapsed() / 1000000.0;
-        *error = QStringLiteral("replayed recovery journal does not match its final content revision");
-        return false;
+    if (headerSchemaVersion == 1) {
+        QElapsedTimer hashTimer;
+        hashTimer.start();
+        const QString recoveredDigest = QString::fromLatin1(contentDigest(*snapshot).toHex());
+        timings->contentHashMs += hashTimer.nsecsElapsed() / 1000000.0;
+        if (recoveredDigest != currentRevision) {
+            timings->journalReplayMs += journalTimer.nsecsElapsed() / 1000000.0;
+            *error = QStringLiteral("replayed recovery journal does not match its final content revision");
+            return false;
+        }
+    } else if (!chainSnapshot) {
+        // A legacy snapshot can be the base of a v2 chain when an empty journal
+        // was created before the first post-upgrade delta. Preserve its digest
+        // as the on-disk base digest until compaction writes a new snapshot.
+        snapshot->insert(QStringLiteral("revisionAlgorithm"),
+                         QLatin1String(ThunderbirdCalendar::DeltaRevisionAlgorithm));
+        snapshot->insert(QStringLiteral("snapshotDigest"), baseContentDigest);
+        snapshot->insert(QStringLiteral("revisionCheckpoint"),
+                         ThunderbirdCalendar::snapshotRevisionCheckpoint(baseContentDigest, baseRevision));
     }
 
     journalRecordCount = recordsReplayed;
     journalBytes = validBytes;
     journalReady = true;
+    journalSchemaVersion = headerSchemaVersion;
     timings->journalRecordsReplayed = recordsReplayed;
     timings->journalFileBytes = validBytes;
     timings->journalReplayMs += journalTimer.nsecsElapsed() / 1000000.0;
-    lastWrittenDigest = QByteArray::fromHex(currentRevision.toLatin1());
+    lastWrittenRevision = QByteArray::fromHex(currentRevision.toLatin1());
     return true;
 }
 
@@ -928,7 +986,15 @@ bool compactJournal(const QString &cachePath,
     qint64 bytesWritten = 0;
     double serializationMs = 0.0;
     double commitMs = 0.0;
-    if (!writeSnapshotAtomically(cachePath, snapshot, &serializationMs, &commitMs, &bytesWritten, error)) {
+    QJsonObject compactedSnapshot = snapshot;
+    compactedSnapshot.insert(QStringLiteral("contentRevision"), revision);
+    compactedSnapshot.insert(QStringLiteral("revisionAlgorithm"),
+                              QLatin1String(ThunderbirdCalendar::DeltaRevisionAlgorithm));
+    const QString snapshotDigest = QString::fromLatin1(contentDigest(compactedSnapshot).toHex());
+    compactedSnapshot.insert(QStringLiteral("snapshotDigest"), snapshotDigest);
+    compactedSnapshot.insert(QStringLiteral("revisionCheckpoint"),
+                             ThunderbirdCalendar::snapshotRevisionCheckpoint(snapshotDigest, revision));
+    if (!writeSnapshotAtomically(cachePath, compactedSnapshot, &serializationMs, &commitMs, &bytesWritten, error)) {
         timings->snapshotSerializationMs += serializationMs;
         timings->diskCommitMs += commitMs;
         timings->journalCompactionMs += phase.nsecsElapsed() / 1000000.0;
@@ -942,7 +1008,8 @@ bool compactJournal(const QString &cachePath,
     // the old journal remains intact but has a different base revision; the
     // next request will safely reset it before appending another record.
     QString journalError;
-    if (!resetJournal(journalPath, revision, &journalError)) {
+    if (!resetJournal(journalPath, revision, &journalError,
+                      ThunderbirdCalendar::DeltaJournalSchemaVersion)) {
         journalReady = false;
         *error = journalError;
         timings->journalCompactionMs += phase.nsecsElapsed() / 1000000.0;
@@ -1025,16 +1092,19 @@ bool acceptSnapshot(const QJsonObject &message,
                       << recoveryError.toStdString() << "\n";
             cachedSnapshot = {};
             hasCachedSnapshot = false;
-            lastWrittenDigest.clear();
+            lastWrittenRevision.clear();
             journalReady = false;
         }
     }
     timings->cachePreparationMs = timings->cacheDirectoryMs + timings->existingCacheReadMs
         + timings->cacheValidationMs + timings->journalReplayMs;
 
-    if (hasCachedSnapshot && digest == lastWrittenDigest && QFile::exists(cachePath)) {
+    if (hasCachedSnapshot && digest == contentDigest(cachedSnapshot) && QFile::exists(cachePath)) {
         timings->unchanged = true;
-        timings->revision = QString::fromLatin1(lastWrittenDigest.toHex());
+        timings->revision = cachedSnapshot.value(QStringLiteral("contentRevision")).toString();
+        if (timings->revision.isEmpty()) {
+            timings->revision = QString::fromLatin1(digest.toHex());
+        }
         if (journalRecordCount >= CompactJournalAfterRecords || journalBytes >= CompactJournalAfterBytes) {
             QString compactError;
             if (!compactJournal(cachePath, journalPath, cachedSnapshot, timings->revision, timings, &compactError)) {
@@ -1051,7 +1121,7 @@ bool acceptSnapshot(const QJsonObject &message,
     if (incrementalUpdate) {
         previousRevision = cachedSnapshot.value(QStringLiteral("contentRevision")).toString();
         if (previousRevision.isEmpty()) {
-            previousRevision = QString::fromLatin1(lastWrittenDigest.toHex());
+            previousRevision = QString::fromLatin1(lastWrittenRevision.toHex());
         }
         QHash<QString, IndexedEvent> previousEvents;
         phase.restart();
@@ -1063,6 +1133,11 @@ bool acceptSnapshot(const QJsonObject &message,
 
     QJsonObject persistedSnapshot = snapshot;
     persistedSnapshot.insert(QStringLiteral("contentRevision"), revision);
+    persistedSnapshot.insert(QStringLiteral("revisionAlgorithm"),
+                             QLatin1String(ThunderbirdCalendar::DeltaRevisionAlgorithm));
+    persistedSnapshot.insert(QStringLiteral("snapshotDigest"), revision);
+    persistedSnapshot.insert(QStringLiteral("revisionCheckpoint"),
+                             ThunderbirdCalendar::snapshotRevisionCheckpoint(revision, revision));
     phase.restart();
     qint64 bytesWritten = 0;
     double serializationMs = 0.0;
@@ -1078,7 +1153,7 @@ bool acceptSnapshot(const QJsonObject &message,
     timings->diskCommitMs += commitMs;
     timings->cacheWriteBytes = bytesWritten;
 
-    lastWrittenDigest = digest;
+    lastWrittenRevision = QByteArray::fromHex(revision.toLatin1());
     cachedSnapshot = persistedSnapshot;
     hasCachedSnapshot = true;
 
@@ -1086,7 +1161,7 @@ bool acceptSnapshot(const QJsonObject &message,
     if (!resetJournal(journalPath, revision, &journalError)) {
         // The snapshot itself is safely committed. The old journal is ignored
         // on the next load because its header base revision will not match.
-            journalReady = false;
+        journalReady = false;
         std::cerr << "Thunderbird Plasma Calendar: snapshot committed but journal reset failed: "
                   << journalError.toStdString() << "\n";
     }
@@ -1157,7 +1232,6 @@ bool acceptEventChanges(const QJsonObject &message,
             return false;
         }
         hasCachedSnapshot = true;
-        lastWrittenDigest = contentDigest(cachedSnapshot);
     }
     timings->cachePreparationMs = timings->cacheDirectoryMs + timings->existingCacheReadMs
         + timings->cacheValidationMs + timings->journalReplayMs;
@@ -1168,11 +1242,34 @@ bool acceptEventChanges(const QJsonObject &message,
         currentRevision = QString::fromLatin1(contentDigest(cachedSnapshot).toHex());
         timings->contentHashMs += phase.nsecsElapsed() / 1000000.0;
         cachedSnapshot.insert(QStringLiteral("contentRevision"), currentRevision);
-        lastWrittenDigest = QByteArray::fromHex(currentRevision.toLatin1());
     }
     if (!ensureJournalReady(journalPath, currentRevision, error)) {
         *errorCode = QStringLiteral("JOURNAL_WRITE_ERROR");
         return false;
+    }
+
+    // Upgrade legacy content-hash journals once, before appending the first
+    // chain revision. Compaction writes the recovered current state as the new
+    // base snapshot, so no existing acknowledged changes are discarded.
+    if (!ThunderbirdCalendar::usesDeltaRevisionChain(cachedSnapshot)
+        || journalSchemaVersion != ThunderbirdCalendar::DeltaJournalSchemaVersion) {
+        QJsonObject migratedSnapshot = cachedSnapshot;
+        migratedSnapshot.insert(QStringLiteral("contentRevision"), currentRevision);
+        migratedSnapshot.insert(QStringLiteral("revisionAlgorithm"),
+                                QLatin1String(ThunderbirdCalendar::DeltaRevisionAlgorithm));
+        const QString migratedSnapshotDigest = QString::fromLatin1(contentDigest(migratedSnapshot).toHex());
+        migratedSnapshot.insert(QStringLiteral("snapshotDigest"), migratedSnapshotDigest);
+        migratedSnapshot.insert(QStringLiteral("revisionCheckpoint"),
+                                ThunderbirdCalendar::snapshotRevisionCheckpoint(
+                                    migratedSnapshotDigest, currentRevision));
+        QString migrationError;
+        if (!compactJournal(cachePath, journalPath, migratedSnapshot, currentRevision,
+                            timings, &migrationError)) {
+            *errorCode = QStringLiteral("JOURNAL_MIGRATION_FAILED");
+            *error = QStringLiteral("could not migrate the legacy event journal: %1").arg(migrationError);
+            return false;
+        }
+        cachedSnapshot = migratedSnapshot;
     }
     timings->revision = currentRevision;
 
@@ -1340,16 +1437,15 @@ bool acceptEventChanges(const QJsonObject &message,
     updatedSnapshot.insert(QStringLiteral("generatedAt"), generatedAt);
 
     phase.restart();
-    const QByteArray digest = contentDigest(updatedSnapshot);
-    timings->contentHashMs += phase.nsecsElapsed() / 1000000.0;
-    const QString revision = QString::fromLatin1(digest.toHex());
     const QString previousRevision = currentRevision;
+    const QString revision = ThunderbirdCalendar::nextDeltaRevision(previousRevision, deltas);
+    timings->contentHashMs += phase.nsecsElapsed() / 1000000.0;
     timings->revision = revision;
     updatedSnapshot.insert(QStringLiteral("contentRevision"), revision);
 
     QJsonObject record{
         {QStringLiteral("type"), QStringLiteral("delta")},
-        {QStringLiteral("schemaVersion"), 1},
+        {QStringLiteral("schemaVersion"), ThunderbirdCalendar::DeltaJournalSchemaVersion},
         {QStringLiteral("previousRevision"), previousRevision},
         {QStringLiteral("revision"), revision},
         {QStringLiteral("generatedAt"), generatedAt},
@@ -1397,7 +1493,7 @@ bool acceptEventChanges(const QJsonObject &message,
         // unacknowledged tail before accepting another direct change.
         hasCachedSnapshot = false;
         cachedSnapshot = {};
-        lastWrittenDigest.clear();
+        lastWrittenRevision.clear();
         journalReady = false;
         *errorCode = QStringLiteral("JOURNAL_APPEND_FAILED");
         *error = appendError;
@@ -1416,7 +1512,7 @@ bool acceptEventChanges(const QJsonObject &message,
 
     // The journal record has been fsync'd, so it is durable before D-Bus
     // delivery and before the native-messaging acknowledgement is returned.
-    lastWrittenDigest = digest;
+    lastWrittenRevision = QByteArray::fromHex(revision.toLatin1());
     cachedSnapshot = updatedSnapshot;
     hasCachedSnapshot = true;
 
@@ -1473,6 +1569,39 @@ int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
     QCoreApplication::setApplicationName(QStringLiteral("thunderbird-calendar-native-host"));
+
+    // Enforce one active Thunderbird integration per Unix user, even when
+    // different profiles or native/Flatpak builds use different cache roots.
+    // XDG_RUNTIME_DIR is per-user and normally shared by every desktop app.
+    QString lockDirectory;
+    QString profileLockSetupError;
+    const auto lockDirectoryPermissions = QFileDevice::ReadOwner
+        | QFileDevice::WriteOwner | QFileDevice::ExeOwner;
+    QString lastLockDirectoryError;
+    for (const QString &candidate : profileLockDirectoryCandidates()) {
+        if (!QDir().mkpath(candidate)) {
+            lastLockDirectoryError = QStringLiteral("could not create '%1'").arg(candidate);
+            continue;
+        }
+        if (!QFile::setPermissions(candidate, lockDirectoryPermissions)) {
+            lastLockDirectoryError = QStringLiteral("could not restrict permissions on '%1'").arg(candidate);
+            continue;
+        }
+        lockDirectory = candidate;
+        break;
+    }
+    if (lockDirectory.isEmpty()) {
+        profileLockSetupError = QStringLiteral("could not create a private per-user native-host lock directory: %1")
+            .arg(lastLockDirectoryError);
+        // Keep the lock path non-empty; all requests will receive the explicit
+        // PROFILE_LOCK_ERROR above without attempting to use this fallback.
+        lockDirectory = cacheDirectory();
+    }
+    QLockFile profileLock(lockDirectory + QStringLiteral("/native-host.lock"));
+    profileLock.setStaleLockTime(0); // rely on the owning PID, not an age heuristic
+    if (profileLockSetupError.isEmpty()) {
+        profileLock.tryLock(0);
+    }
 
     while (true) {
         // Time waiting for Thunderbird separately. This interval is idle time
@@ -1582,12 +1711,39 @@ int main(int argc, char **argv)
         QString errorCode;
         const QString messageType = request.value(QStringLiteral("type")).toString();
         timings.messageType = messageType;
-        const bool ok = messageType == QStringLiteral("snapshot")
-            ? acceptSnapshot(request, &error, &errorCode, &timings)
-            : messageType == QStringLiteral("eventChanges")
-                ? acceptEventChanges(request, &error, &errorCode, &timings)
-                : false;
-        if (messageType != QStringLiteral("snapshot") && messageType != QStringLiteral("eventChanges")) {
+
+        bool ok = false;
+        if (!profileLockSetupError.isEmpty()) {
+            errorCode = QStringLiteral("PROFILE_LOCK_ERROR");
+            error = profileLockSetupError;
+        } else if (!profileLock.isLocked() && !profileLock.tryLock(0)) {
+            if (profileLock.error() == QLockFile::LockFailedError) {
+                qint64 ownerPid = 0;
+                QString ownerHost;
+                QString ownerApp;
+                profileLock.getLockInfo(&ownerPid, &ownerHost, &ownerApp);
+                errorCode = QStringLiteral("ACTIVE_PROFILE_LOCKED");
+                error = QStringLiteral("another Thunderbird profile is already using the shared calendar cache");
+                if (ownerPid > 0) {
+                    error += QStringLiteral(" (lock owner PID %1").arg(ownerPid);
+                    if (!ownerApp.isEmpty()) {
+                        error += QStringLiteral(", %1").arg(ownerApp);
+                    }
+                    if (!ownerHost.isEmpty()) {
+                        error += QStringLiteral(", host %1").arg(ownerHost);
+                    }
+                    error += QLatin1Char(')');
+                }
+            } else {
+                errorCode = QStringLiteral("PROFILE_LOCK_ERROR");
+                error = QStringLiteral("could not acquire the single-profile lock: %1")
+                    .arg(static_cast<int>(profileLock.error()));
+            }
+        } else if (messageType == QStringLiteral("snapshot")) {
+            ok = acceptSnapshot(request, &error, &errorCode, &timings);
+        } else if (messageType == QStringLiteral("eventChanges")) {
+            ok = acceptEventChanges(request, &error, &errorCode, &timings);
+        } else {
             errorCode = QStringLiteral("INVALID_MESSAGE_TYPE");
             error = QStringLiteral("supported message types are snapshot and eventChanges");
         }

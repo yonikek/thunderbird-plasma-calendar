@@ -11,12 +11,33 @@ const RECONNECT_BASE_MS = 15 * 1000;
 const RECONNECT_MAX_MS = 15 * 60 * 1000;
 const SNAPSHOT_RETRY_BASE_MS = 5 * 1000;
 const SNAPSHOT_RETRY_MAX_MS = 5 * 60 * 1000;
+const MAX_AUTOMATIC_SNAPSHOT_RETRIES = 5;
+const PROFILE_LOCK_RETRY_BASE_MS = 60 * 1000;
+const PROFILE_LOCK_RETRY_MAX_MS = 5 * 60 * 1000;
 const NATIVE_ACK_TIMEOUT_MS = 60 * 1000;
 const MAX_NATIVE_MESSAGE_BYTES = 32 * 1024 * 1024;
 const ITEM_CHANGE_DEBOUNCE_MS = 120;
 const MAX_QUEUED_ITEM_CHANGES = 5000;
 const MAX_ITEM_CHANGES_PER_MESSAGE = 1000;
 const ITEM_CHANGE_RETRY_MS = 1500;
+const ITEM_CHANGE_RETRY_MAX_MS = 60 * 1000;
+const MAX_AUTOMATIC_ITEM_CHANGE_RETRIES = 5;
+
+const FULL_SNAPSHOT_FALLBACK_CODES = new Set([
+  "FULL_SNAPSHOT_REQUIRED",
+  "NATIVE_MESSAGE_TOO_LARGE",
+  "JOURNAL_RECORD_TOO_LARGE",
+  "JOURNAL_WRITE_ERROR",
+  "JOURNAL_APPEND_FAILED",
+  "JOURNAL_COMPACTION_FAILED"
+]);
+const PERMANENT_NATIVE_ERROR_CODES = new Set([
+  "NATIVE_MESSAGE_TOO_LARGE",
+  "EVENT_LIMIT_EXCEEDED",
+  "INVALID_EVENT_CHANGES",
+  "INVALID_MESSAGE_TYPE",
+  "PROFILE_LOCK_ERROR"
+]);
 
 let nativePort = null;
 let refreshInProgress = false;
@@ -28,6 +49,13 @@ let reconnectTimer = null;
 let reconnectDelayMs = RECONNECT_BASE_MS;
 let snapshotRetryTimer = null;
 let snapshotRetryDelayMs = SNAPSHOT_RETRY_BASE_MS;
+let snapshotRetryAttempts = 0;
+let profileLockBlocked = false;
+let profileLockRetryTimer = null;
+let profileLockRetryDelayMs = PROFILE_LOCK_RETRY_BASE_MS;
+let itemChangeRetryAttempts = 0;
+let itemChangeRetriesExhausted = false;
+let snapshotRecoveryPending = false;
 let debugLogsEnabled = false;
 let nextRequestId = 1;
 const pendingAcks = new Map();
@@ -135,7 +163,8 @@ function eventChangeKey(change) {
 }
 
 function scheduleItemChangeFlush(delay = ITEM_CHANGE_DEBOUNCE_MS) {
-  if (itemChangeFlushTimer !== null || itemChangeRetryTimer !== null || pendingItemChanges.size === 0) {
+  if (profileLockBlocked || itemChangeRetriesExhausted || snapshotRecoveryPending
+      || itemChangeFlushTimer !== null || itemChangeRetryTimer !== null || pendingItemChanges.size === 0) {
     return;
   }
   itemChangeFlushTimer = setTimeout(() => {
@@ -148,6 +177,20 @@ function queueItemChanges(changes) {
   if (!Array.isArray(changes) || changes.length === 0) {
     return;
   }
+
+  // Reject oversized batches before iterating or growing the pending map.
+  // The Experiment API normally enforces this limit too, but this boundary
+  // must remain safe if a future caller or a malformed event bypasses it.
+  if (changes.length > MAX_QUEUED_ITEM_CHANGES) {
+    pendingItemChanges.clear();
+    fullRefreshNext = true;
+    debugLog("warn", "direct item-change batch exceeded its safety limit; falling back to a full snapshot");
+    requestRefresh();
+    return;
+  }
+
+  const validChanges = [];
+  const incomingKeys = new Set();
   for (const change of changes) {
     if (!change || !["add", "modify", "remove"].includes(change.operation)
         || typeof change.calendarId !== "string"
@@ -155,23 +198,42 @@ function queueItemChanges(changes) {
       debugLog("warn", "ignored malformed direct calendar item change:", change);
       continue;
     }
+    validChanges.push(change);
+    incomingKeys.add(eventChangeKey(change));
+  }
+
+  let additionalKeys = 0;
+  for (const key of incomingKeys) {
+    if (!pendingItemChanges.has(key)) {
+      additionalKeys++;
+    }
+  }
+  if (pendingItemChanges.size + additionalKeys > MAX_QUEUED_ITEM_CHANGES) {
+    pendingItemChanges.clear();
+    fullRefreshNext = true;
+    debugLog("warn", "direct item-change queue would exceed its safety limit; falling back to a full snapshot");
+    requestRefresh();
+    return;
+  }
+
+  for (const change of validChanges) {
     // Keep the final desired state for each calendar/UID during the short
     // debounce window. The host resolves add-vs-modify against its own snapshot.
     pendingItemChanges.set(eventChangeKey(change), change);
   }
 
-  if (pendingItemChanges.size > MAX_QUEUED_ITEM_CHANGES) {
-    pendingItemChanges.clear();
-    fullRefreshNext = true;
-    debugLog("warn", "direct item-change queue exceeded its safety limit; falling back to a full snapshot");
-    requestRefresh();
-    return;
+  if (itemChangeRetriesExhausted) {
+    // A new calendar notification is a new opportunity to retry a previously
+    // paused transient failure. Old queued changes are kept and coalesced with it.
+    itemChangeRetriesExhausted = false;
+    itemChangeRetryAttempts = 0;
   }
   scheduleItemChangeFlush();
 }
 
 async function flushItemChanges() {
-  if (!nativePort || pendingItemChanges.size === 0 || itemChangeFlushInProgress) {
+  if (!nativePort || profileLockBlocked || itemChangeRetriesExhausted || snapshotRecoveryPending
+      || pendingItemChanges.size === 0 || itemChangeFlushInProgress) {
     return;
   }
   if (refreshInProgress) {
@@ -194,40 +256,65 @@ async function flushItemChanges() {
       logDirectUpdateTiming(changes.length, directUpdateStarted, directUpdateAcknowledged, response);
     }
     reconnectDelayMs = RECONNECT_BASE_MS;
+    itemChangeRetryAttempts = 0;
+    itemChangeRetriesExhausted = false;
+    clearProfileLockBlocked();
   } catch (error) {
-    if (error && error.code === "FULL_SNAPSHOT_REQUIRED") {
-      // The host cache was lost or no longer contains one of the referenced
-      // calendars. A full read re-establishes the authoritative base state.
-      pendingItemChanges.clear();
-      fullRefreshNext = true;
-      debugLog("warn", "native host requested a full snapshot; rebuilding its calendar cache");
-      requestRefresh();
-    } else {
-      // Restore failed changes without overwriting newer changes that arrived
-      // while this request was in flight.
+    const code = error && error.code;
+    const restoreFailedBatch = () => {
       for (const [key, change] of batchEntries) {
         if (!pendingItemChanges.has(key)) {
           pendingItemChanges.set(key, change);
         }
       }
-      if (error && error.code === "NATIVE_MESSAGE_TOO_LARGE") {
-        console.error("Thunderbird Plasma Calendar:", error.message || error);
-        pendingItemChanges.clear();
-        fullRefreshNext = true;
-        requestRefresh();
+    };
+
+    if (code === "ACTIVE_PROFILE_LOCKED") {
+      restoreFailedBatch();
+      enterProfileLockBlocked(error);
+    } else if (FULL_SNAPSHOT_FALLBACK_CODES.has(code)) {
+      // A compacted/full snapshot is a safe fallback for deltas that cannot be
+      // represented or appended to the current journal. Keep queued updates:
+      // the refresh will absorb them where possible, and any remaining direct
+      // changes are harmlessly coalesced against the new baseline.
+      restoreFailedBatch();
+      snapshotRecoveryPending = true;
+      fullRefreshNext = true;
+      debugLog("warn", `native host requested snapshot recovery (${code}); pausing direct updates until the full snapshot is committed`);
+      requestRefresh();
+    } else if (PERMANENT_NATIVE_ERROR_CODES.has(code)) {
+      // Do not retry the same invalid or unsupported update indefinitely.
+      // Report this even when verbose debug logging is disabled.
+      console.error("Thunderbird Plasma Calendar:", error.message || error);
+      itemChangeRetriesExhausted = true;
+    } else {
+      restoreFailedBatch();
+      itemChangeRetryAttempts++;
+      if (itemChangeRetryAttempts > MAX_AUTOMATIC_ITEM_CHANGE_RETRIES) {
+        itemChangeRetriesExhausted = true;
+        console.error(
+          "Thunderbird Plasma Calendar: direct calendar updates have been paused after " +
+          `${MAX_AUTOMATIC_ITEM_CHANGE_RETRIES} failed attempts. ${pendingItemChanges.size} change(s) remain queued; ` +
+          "a new calendar change or manual refresh will retry them. Last error: " + (error.message || error)
+        );
       } else {
-        debugLog("error", "direct calendar update failed; will retry:", error);
+        debugLog("error", "direct calendar update failed; will retry with bounded backoff:", error);
         if (itemChangeRetryTimer === null) {
+          const delay = Math.min(
+            ITEM_CHANGE_RETRY_MS * (2 ** (itemChangeRetryAttempts - 1)),
+            ITEM_CHANGE_RETRY_MAX_MS
+          );
           itemChangeRetryTimer = setTimeout(() => {
             itemChangeRetryTimer = null;
             scheduleItemChangeFlush(0);
-          }, ITEM_CHANGE_RETRY_MS);
+          }, delay);
         }
       }
     }
   } finally {
     itemChangeFlushInProgress = false;
-    if (pendingItemChanges.size > 0 && itemChangeRetryTimer === null) {
+    if (pendingItemChanges.size > 0 && itemChangeRetryTimer === null
+        && !profileLockBlocked && !itemChangeRetriesExhausted && !snapshotRecoveryPending) {
       scheduleItemChangeFlush(0);
     }
     if (refreshQueued) {
@@ -239,6 +326,10 @@ async function flushItemChanges() {
 
 async function refreshCalendarCache() {
   if (!nativePort) {
+    return;
+  }
+  if (profileLockBlocked) {
+    scheduleProfileLockRetry();
     return;
   }
   if (refreshInProgress || itemChangeFlushInProgress) {
@@ -273,6 +364,15 @@ async function refreshCalendarCache() {
     const readFinished = performance.now();
     const delivery = await sendSnapshotAndWait(snapshot);
     const acknowledged = performance.now();
+    clearProfileLockBlocked();
+    snapshotRecoveryPending = false;
+    // A successful authoritative snapshot repairs any earlier direct-update
+    // error state, because it now represents the provider's current contents.
+    itemChangeRetryAttempts = 0;
+    itemChangeRetriesExhausted = false;
+    if (!snapshot.calendars.some(calendar => calendar.retryable === true)) {
+      snapshotRetryAttempts = 0;
+    }
     if (snapshot.calendars.some(calendar => calendar.retryable === true)) {
       scheduleSnapshotRetry();
     } else {
@@ -286,15 +386,19 @@ async function refreshCalendarCache() {
     if (requestedFullRefresh && !snapshotBuilt) {
       fullRefreshNext = true;
     }
-    if (error && error.code === "NATIVE_MESSAGE_TOO_LARGE") {
-      // This is an actionable delivery failure, not optional diagnostic noise.
-      // Keep it visible even when verbose debug logging is disabled.
+    const code = error && error.code;
+    if (code === "ACTIVE_PROFILE_LOCKED") {
+      enterProfileLockBlocked(error);
+    } else if (PERMANENT_NATIVE_ERROR_CODES.has(code)
+        || (error && error.name === "SnapshotTooLargeError")
+        || String(error && (error.message || error) || "").includes("snapshot too large")) {
+      // Unsupported, invalid or oversized snapshots cannot succeed by retrying
+      // the same payload. Keep this visible without requiring debug logging.
       console.error("Thunderbird Plasma Calendar:", error.message || error);
+      clearSnapshotRetry();
     } else {
       debugLog("error", "calendar refresh/delivery failed:", error);
-    }
-    if (error && error.code !== "NATIVE_MESSAGE_TOO_LARGE" && error.name !== "SnapshotTooLargeError" && !String(error.message || error).includes("snapshot too large")) {
-      scheduleSnapshotRetry();
+      scheduleSnapshotRetry(error);
     }
   } finally {
     refreshInProgress = false;
@@ -404,6 +508,11 @@ function logDirectUpdateTiming(changeCount, started, acknowledged, response) {
 }
 
 function requestRefresh() {
+  if (profileLockBlocked) {
+    scheduleProfileLockRetry();
+    return;
+  }
+  clearSnapshotRetry();
   const now = Date.now();
   if (debounceTimer === null) {
     firstPendingAt = now;
@@ -426,21 +535,65 @@ function clearSnapshotRetry() {
     snapshotRetryTimer = null;
   }
   snapshotRetryDelayMs = SNAPSHOT_RETRY_BASE_MS;
+  snapshotRetryAttempts = 0;
 }
 
-function scheduleSnapshotRetry() {
+function scheduleSnapshotRetry(error) {
   if (snapshotRetryTimer !== null) {
     return;
   }
+  if (snapshotRetryAttempts >= MAX_AUTOMATIC_SNAPSHOT_RETRIES) {
+    console.error(
+      "Thunderbird Plasma Calendar: automatic snapshot retries paused after " +
+      `${MAX_AUTOMATIC_SNAPSHOT_RETRIES} failed attempts. A new calendar change or manual refresh will retry. ` +
+      "Last error: " + (error && (error.message || error) || "unknown error")
+    );
+    return;
+  }
+  snapshotRetryAttempts++;
+  const delay = snapshotRetryDelayMs;
   snapshotRetryTimer = setTimeout(() => {
     snapshotRetryTimer = null;
-    // A disconnected port already has its own reconnect timer. Its successful
-    // connection performs an initial refresh, so do not reset that backoff.
-    if (nativePort) {
+    if (nativePort && !profileLockBlocked) {
       refreshCalendarCache();
     }
-  }, snapshotRetryDelayMs);
+  }, delay);
   snapshotRetryDelayMs = Math.min(snapshotRetryDelayMs * 2, SNAPSHOT_RETRY_MAX_MS);
+}
+
+function clearProfileLockBlocked() {
+  profileLockBlocked = false;
+  profileLockRetryDelayMs = PROFILE_LOCK_RETRY_BASE_MS;
+  if (profileLockRetryTimer !== null) {
+    clearTimeout(profileLockRetryTimer);
+    profileLockRetryTimer = null;
+  }
+}
+
+function enterProfileLockBlocked(error) {
+  if (!profileLockBlocked) {
+    console.error(
+      "Thunderbird Plasma Calendar: another Thunderbird profile appears to be using this calendar cache. " +
+      "Only one Thunderbird profile can use the integration at a time. Close the other Thunderbird instance. " +
+      "The extension will check again automatically. " + (error && error.message || "")
+    );
+  }
+  profileLockBlocked = true;
+  scheduleProfileLockRetry();
+}
+
+function scheduleProfileLockRetry() {
+  if (profileLockRetryTimer !== null) {
+    return;
+  }
+  const delay = profileLockRetryDelayMs;
+  profileLockRetryTimer = setTimeout(() => {
+    profileLockRetryTimer = null;
+    profileLockBlocked = false;
+    fullRefreshNext = true;
+    refreshCalendarCache();
+  }, delay);
+  profileLockRetryDelayMs = Math.min(profileLockRetryDelayMs * 2, PROFILE_LOCK_RETRY_MAX_MS);
 }
 
 function scheduleReconnect() {

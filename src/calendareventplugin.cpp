@@ -1,5 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "calendareventplugin.h"
+#include "calendarvisibility.h"
+#include "calendartimeutils.h"
+#include "revisionutils.h"
 
 #include <KConfigGroup>
 #include <KSharedConfig>
@@ -11,14 +14,17 @@
 #include <QDateTime>
 #include <QDebug>
 #include <QFile>
+#include <QFileInfo>
 #include <QHash>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QList>
 #include <QMultiHash>
 #include <QStandardPaths>
 #include <QStringList>
 #include <QTime>
+#include <QTimer>
 
 #include <algorithm>
 #include <utility>
@@ -45,17 +51,58 @@ QString journalPath()
     return cacheDirectoryPath() + QStringLiteral("/events.journal");
 }
 
+QString fileFingerprint(const QString &path)
+{
+    QFileInfo info(path);
+    info.refresh();
+    if (!info.exists()) {
+        return QStringLiteral("missing");
+    }
+    return QStringLiteral("%1:%2")
+        .arg(info.size())
+        .arg(info.lastModified().toMSecsSinceEpoch());
+}
+
+QString cacheFingerprint()
+{
+    return fileFingerprint(snapshotPath()) + QLatin1Char('|') + fileFingerprint(journalPath());
+}
+
+QSet<QString> eventUids(const QMultiHash<QDate, CalendarEvents::EventData> &events)
+{
+    QSet<QString> result;
+    result.reserve(events.size());
+    for (auto it = events.cbegin(); it != events.cend(); ++it) {
+        result.insert(it.value().uid());
+    }
+    return result;
+}
+
+QSet<QString> staleCalendarIds(const QJsonArray &calendars)
+{
+    QSet<QString> result;
+    for (const QJsonValue &value : calendars) {
+        const QJsonObject calendar = value.toObject();
+        const QString id = calendar.value(QStringLiteral("id")).toString();
+        if (!id.isEmpty() && isStaleCalendar(calendar)) {
+            result.insert(id);
+        }
+    }
+    return result;
+}
+
+bool showStaleEventsFromConfig()
+{
+    const KConfigGroup group = KSharedConfig::openConfig()->group(QString::fromLatin1(ConfigGroupName));
+    return group.readEntry(QStringLiteral("showStaleEvents"), true);
+}
+
 constexpr qint64 MaxJournalBytes = 16 * 1024 * 1024;
 constexpr int MaxEventsPerCalendar = 100000;
 
 QByteArray contentDigest(QJsonObject snapshot)
 {
-    snapshot.remove(QStringLiteral("generatedAt"));
-    snapshot.remove(QStringLiteral("rangeStart"));
-    snapshot.remove(QStringLiteral("rangeEnd"));
-    snapshot.remove(QStringLiteral("contentRevision"));
-    return QCryptographicHash::hash(
-        QJsonDocument(snapshot).toJson(QJsonDocument::Compact), QCryptographicHash::Sha256).toHex();
+    return ThunderbirdCalendar::snapshotContentDigest(std::move(snapshot)).toHex();
 }
 
 QByteArray journalRecordChecksum(QJsonObject record)
@@ -201,25 +248,49 @@ bool replayJournal(QJsonObject *snapshot, QString *error)
         return false;
     }
     const QJsonObject header = headerDocument.object();
+    const int headerSchemaVersion = header.value(QStringLiteral("schemaVersion")).toInt(-1);
     if (header.value(QStringLiteral("type")).toString() != QStringLiteral("header")
-        || header.value(QStringLiteral("schemaVersion")).toInt(-1) != 1
+        || (headerSchemaVersion != 1
+            && headerSchemaVersion != ThunderbirdCalendar::DeltaJournalSchemaVersion)
         || !header.value(QStringLiteral("baseRevision")).isString()) {
         *error = QStringLiteral("event journal header has an unsupported schema");
         return false;
     }
 
-    const QString baseRevision = QString::fromLatin1(contentDigest(*snapshot));
     const QString storedBaseRevision = snapshot->value(QStringLiteral("contentRevision")).toString();
-    if (!storedBaseRevision.isEmpty() && storedBaseRevision != baseRevision) {
-        *error = QStringLiteral("base snapshot does not match its stored content revision");
-        return false;
+    const QString baseContentDigest = QString::fromLatin1(contentDigest(*snapshot));
+    const bool chainSnapshot = ThunderbirdCalendar::usesDeltaRevisionChain(*snapshot);
+    QString baseRevision = storedBaseRevision;
+    if (chainSnapshot) {
+        if (storedBaseRevision.isEmpty()
+            || !ThunderbirdCalendar::snapshotRevisionCheckpointMatches(*snapshot, baseContentDigest)) {
+            *error = QStringLiteral("base snapshot content or revision checkpoint is invalid");
+            return false;
+        }
+    } else {
+        if (!storedBaseRevision.isEmpty() && storedBaseRevision != baseContentDigest) {
+            *error = QStringLiteral("base snapshot does not match its stored content revision");
+            return false;
+        }
+        baseRevision = baseContentDigest;
+        snapshot->insert(QStringLiteral("contentRevision"), baseRevision);
     }
-    if (header.value(QStringLiteral("baseRevision")).toString() != baseRevision) {
+    if (header.value(QStringLiteral("baseRevision")).toString() != baseRevision
+        || (chainSnapshot && headerSchemaVersion != ThunderbirdCalendar::DeltaJournalSchemaVersion)) {
         // A full snapshot is committed before the journal header is reset.
         // If a crash occurs between those operations, the newer snapshot wins.
         return true;
     }
 
+    if (headerSchemaVersion == ThunderbirdCalendar::DeltaJournalSchemaVersion && !chainSnapshot) {
+        // A legacy snapshot may have an empty v2 journal header if the host was
+        // upgraded but no direct update has yet triggered snapshot migration.
+        snapshot->insert(QStringLiteral("revisionAlgorithm"),
+                         QLatin1String(ThunderbirdCalendar::DeltaRevisionAlgorithm));
+        snapshot->insert(QStringLiteral("snapshotDigest"), baseContentDigest);
+        snapshot->insert(QStringLiteral("revisionCheckpoint"),
+                         ThunderbirdCalendar::snapshotRevisionCheckpoint(baseContentDigest, baseRevision));
+    }
     snapshot->insert(QStringLiteral("contentRevision"), baseRevision);
     QString currentRevision = baseRevision;
     qsizetype offset = headerEnd + 1;
@@ -241,10 +312,15 @@ bool replayJournal(QJsonObject *snapshot, QString *error)
         const QString revision = record.value(QStringLiteral("revision")).toString();
         const QJsonValue deltas = record.value(QStringLiteral("deltas"));
         if (record.value(QStringLiteral("type")).toString() != QStringLiteral("delta")
-            || record.value(QStringLiteral("schemaVersion")).toInt(-1) != 1
+            || record.value(QStringLiteral("schemaVersion")).toInt(-1) != headerSchemaVersion
             || previousRevision != currentRevision || revision.isEmpty() || !deltas.isArray()
             || record.value(QStringLiteral("checksum")).toString().toLatin1() != journalRecordChecksum(record)) {
             *error = QStringLiteral("event journal revision chain or checksum is invalid");
+            return false;
+        }
+        if (headerSchemaVersion == ThunderbirdCalendar::DeltaJournalSchemaVersion
+            && revision != ThunderbirdCalendar::nextDeltaRevision(currentRevision, deltas.toArray())) {
+            *error = QStringLiteral("event journal delta revision is invalid");
             return false;
         }
         QString applyError;
@@ -261,27 +337,14 @@ bool replayJournal(QJsonObject *snapshot, QString *error)
         offset = lineEnd + 1;
     }
 
-    const QString actualRevision = QString::fromLatin1(contentDigest(*snapshot));
-    if (actualRevision != currentRevision) {
-        *error = QStringLiteral("replayed event journal does not match its final content revision");
-        return false;
+    if (headerSchemaVersion == 1) {
+        const QString actualRevision = QString::fromLatin1(contentDigest(*snapshot));
+        if (actualRevision != currentRevision) {
+            *error = QStringLiteral("replayed event journal does not match its final content revision");
+            return false;
+        }
     }
     return true;
-}
-
-QDateTime parseDateTime(const QString &value, bool allDay)
-{
-    if (allDay) {
-        const QDate date = QDate::fromString(value.left(10), Qt::ISODate);
-        return date.isValid() ? date.startOfDay() : QDateTime();
-    }
-    QDateTime result = QDateTime::fromString(value, Qt::ISODateWithMs);
-    if (!result.isValid()) {
-        result = QDateTime::fromString(value, Qt::ISODate);
-    }
-    // Timed values arrive as UTC instants. Convert so that date() is the local
-    // calendar day the clock should place the event on.
-    return result.isValid() ? result.toLocalTime() : result;
 }
 
 // iCalendar DTEND is exclusive for DATE values. A timed event ending exactly
@@ -321,8 +384,12 @@ bool toEventData(const QJsonObject &source, const QString &calendarColor,
                  CalendarEvents::EventData *event, QDate *startDay = nullptr)
 {
     const bool allDay = source.value(QStringLiteral("allDay")).toBool(false);
-    const QDateTime start = parseDateTime(source.value(QStringLiteral("start")).toString(), allDay);
-    const QDateTime end = parseDateTime(source.value(QStringLiteral("end")).toString(), allDay);
+    const QDateTime start = ThunderbirdCalendar::parseDateTime(
+        source.value(QStringLiteral("start")).toString(), allDay,
+        source.value(QStringLiteral("startFloating")).toBool(false));
+    const QDateTime end = ThunderbirdCalendar::parseDateTime(
+        source.value(QStringLiteral("end")).toString(), allDay,
+        source.value(QStringLiteral("endFloating")).toBool(false));
     if (!start.isValid() || !end.isValid()) {
         return false;
     }
@@ -398,7 +465,11 @@ QJsonObject readSnapshot(QString *error = nullptr)
     if (replayJournal(&replayedSnapshot, &journalError)) {
         snapshot = replayedSnapshot;
     } else {
-        qWarning() << "Thunderbird Calendar: ignoring invalid event journal:" << journalError;
+        if (error) {
+            *error = journalError;
+        }
+        qWarning() << "Thunderbird Calendar [Plasma]: refusing to use a snapshot with an invalid event journal:" << journalError;
+        return {};
     }
     return snapshot;
 }
@@ -409,12 +480,7 @@ QString revisionForSnapshot(QJsonObject snapshot)
     if (!revision.isEmpty()) {
         return revision;
     }
-    snapshot.remove(QStringLiteral("generatedAt"));
-    snapshot.remove(QStringLiteral("rangeStart"));
-    snapshot.remove(QStringLiteral("rangeEnd"));
-    snapshot.remove(QStringLiteral("contentRevision"));
-    return QString::fromLatin1(QCryptographicHash::hash(
-        QJsonDocument(snapshot).toJson(QJsonDocument::Compact), QCryptographicHash::Sha256).toHex());
+    return ThunderbirdCalendar::snapshotContentRevision(snapshot);
 }
 
 QMultiHash<QDate, CalendarEvents::EventData> eventsForCalendars(
@@ -422,14 +488,16 @@ QMultiHash<QDate, CalendarEvents::EventData> eventsForCalendars(
     const QSet<QString> &selected,
     const QDate &rangeStart,
     const QDate &rangeEnd,
-    const QSet<QString> *onlyCalendarIds = nullptr)
+    const QSet<QString> *onlyCalendarIds = nullptr,
+    bool showStale = true)
 {
     QMultiHash<QDate, CalendarEvents::EventData> result;
     for (const QJsonValue &calendarValue : calendars) {
         const QJsonObject calendar = calendarValue.toObject();
         const QString calendarId = calendar.value(QStringLiteral("id")).toString();
         if (!selected.contains(calendarId)
-            || (onlyCalendarIds && !onlyCalendarIds->contains(calendarId))) {
+            || (onlyCalendarIds && !onlyCalendarIds->contains(calendarId))
+            || !shouldShowCalendarEvents(calendar, showStale)) {
             continue;
         }
         const QString calendarColor = calendar.value(QStringLiteral("color")).toString();
@@ -452,17 +520,6 @@ QMultiHash<QDate, CalendarEvents::EventData> eventsForCalendars(
     return result;
 }
 
-QSet<QString> calendarIds(const QJsonArray &calendars)
-{
-    QSet<QString> result;
-    for (const QJsonValue &value : calendars) {
-        const QString id = value.toObject().value(QStringLiteral("id")).toString();
-        if (!id.isEmpty()) {
-            result.insert(id);
-        }
-    }
-    return result;
-}
 }
 
 ThunderbirdCalendarEventsPlugin::ThunderbirdCalendarEventsPlugin(QObject *parent)
@@ -475,6 +532,18 @@ ThunderbirdCalendarEventsPlugin::ThunderbirdCalendarEventsPlugin(QObject *parent
                 QStringLiteral("EventsDelta"), this, SLOT(onEventsDelta(QString)));
     bus.connect(QString(), QString::fromLatin1(BusPath), QString::fromLatin1(BusInterface),
                 QStringLiteral("ConfigurationChanged"), this, SLOT(onConfigurationChanged()));
+
+    m_cacheRetryClock.start();
+
+    // D-Bus signals are normally immediate, but a plugin can be starting,
+    // reloading or briefly disconnected when a delta is emitted. Poll only
+    // cheap file metadata; read/reconcile the snapshot and journal only when
+    // their size or mtime changes.
+    m_cachePollTimer.setInterval(2000);
+    connect(&m_cachePollTimer, &QTimer::timeout, this, &ThunderbirdCalendarEventsPlugin::onCachePoll);
+    m_cachePollTimer.start();
+    qInfo() << "Thunderbird Calendar [Plasma]: provider initialised; cache polling interval"
+            << m_cachePollTimer.interval() << "ms";
 }
 
 void ThunderbirdCalendarEventsPlugin::loadEventsForDateRange(const QDate &startDate, const QDate &endDate)
@@ -486,17 +555,34 @@ void ThunderbirdCalendarEventsPlugin::loadEventsForDateRange(const QDate &startD
 
 bool ThunderbirdCalendarEventsPlugin::isCalendarSelected(const QString &calendarId) const
 {
-    return !m_hasExplicitSelection || m_selectedCalendarIds.contains(calendarId);
+    const bool selected = !m_hasExplicitSelection || m_selectedCalendarIds.contains(calendarId);
+    return selected && (m_showStaleEvents || !m_staleCalendarIds.contains(calendarId));
 }
 
 void ThunderbirdCalendarEventsPlugin::onEventsChanged()
 {
-    // EventsChanged is reserved for the first snapshot (or recovery when no
-    // readable snapshot existed). Normal updates use EventsDelta and never
-    // republish the complete event collection.
-    if (m_startDate.isValid() && m_endDate.isValid()) {
+    if (!m_startDate.isValid() || !m_endDate.isValid()) {
+        return;
+    }
+    if (m_selectionInitialized && !m_loadedRevision.isEmpty()) {
+        qInfo() << "Thunderbird Calendar [Plasma]: received full-snapshot notification; loaded revision"
+                << m_loadedRevision;
+        reconcileFromSnapshot(QStringLiteral("full-snapshot notification"));
+    } else {
         publishCurrentRange();
     }
+}
+
+void ThunderbirdCalendarEventsPlugin::onCachePoll()
+{
+    if (!m_startDate.isValid() || !m_endDate.isValid()) {
+        return;
+    }
+    const QString fingerprint = cacheFingerprint();
+    if (!m_cacheFingerprintTracker.needsReconciliation(fingerprint, m_cacheRetryClock.elapsed())) {
+        return;
+    }
+    reconcileFromSnapshot(QStringLiteral("cache changed without a matching D-Bus delta"));
 }
 
 void ThunderbirdCalendarEventsPlugin::onConfigurationChanged()
@@ -508,68 +594,190 @@ void ThunderbirdCalendarEventsPlugin::onConfigurationChanged()
 
 void ThunderbirdCalendarEventsPlugin::publishCurrentRange()
 {
-    const QJsonObject snapshot = readSnapshot();
+    QString error;
+    const QJsonObject snapshot = readSnapshot(&error);
+    if (snapshot.isEmpty() && !error.isEmpty()) {
+        qWarning() << "Thunderbird Calendar [Plasma]: initial calendar snapshot is unavailable:" << error;
+        // Keep the previous fingerprint. onCachePoll() must retry this failed
+        // read even when the files do not change again.
+        m_cacheFingerprintTracker.markFailed(cacheFingerprint(), m_cacheRetryClock.elapsed());
+        return;
+    }
     const QJsonArray calendars = snapshot.value(QStringLiteral("calendars")).toArray();
     m_selectedCalendarIds = selectionFromConfig(calendars, &m_hasExplicitSelection);
+    m_staleCalendarIds = staleCalendarIds(calendars);
+    m_showStaleEvents = showStaleEventsFromConfig();
     m_selectionInitialized = true;
     m_loadedRevision = snapshot.isEmpty() ? QString() : revisionForSnapshot(snapshot);
     m_pendingRevision.clear();
     m_pendingPreviousRevision.clear();
     m_receivedDeltaBatches.clear();
     m_pendingBatchCount = 0;
-    Q_EMIT dataReady(eventsForCalendars(calendars, m_selectedCalendarIds, m_startDate, m_endDate));
+
+    const auto events = eventsForCalendars(calendars, m_selectedCalendarIds, m_startDate, m_endDate,
+                                           nullptr, m_showStaleEvents);
+    m_publishedEventUids = eventUids(events);
+    m_cacheFingerprintTracker.markReconciled(cacheFingerprint());
+    Q_EMIT dataReady(events);
+    qInfo() << "Thunderbird Calendar [Plasma]: published date range" << m_startDate << "through" << m_endDate
+            << "calendars" << calendars.size() << "stale calendars" << m_staleCalendarIds.size()
+            << "show stale" << m_showStaleEvents << "events" << events.size()
+            << "revision" << m_loadedRevision;
 }
 
 void ThunderbirdCalendarEventsPlugin::applyCalendarSelectionChanges()
 {
-    const QJsonObject snapshot = readSnapshot();
+    QString error;
+    const QJsonObject snapshot = readSnapshot(&error);
     if (snapshot.isEmpty() || !snapshot.value(QStringLiteral("calendars")).isArray()) {
-        // Do not discard the current selection/revision when the cache is
-        // temporarily unavailable. A later configuration notification or
-        // normal range load can retry once the host has restored the snapshot.
-        qWarning() << "Thunderbird Calendar: cannot reconcile calendar selection; snapshot is unavailable";
+        // Do not discard the current selection/revision or cache fingerprint
+        // when the cache is temporarily unavailable. The unchanged fingerprint
+        // must be retried by the next poll rather than suppressing recovery.
+        qWarning() << "Thunderbird Calendar [Plasma]: cannot reconcile calendar selection; snapshot is unavailable:" << error;
+        m_cacheFingerprintTracker.markFailed(cacheFingerprint(), m_cacheRetryClock.elapsed());
         return;
     }
+
     const QJsonArray calendars = snapshot.value(QStringLiteral("calendars")).toArray();
     bool newHasExplicitSelection = false;
     const QSet<QString> newSelected = selectionFromConfig(calendars, &newHasExplicitSelection);
+    const QSet<QString> newStaleIds = staleCalendarIds(calendars);
+    const bool newShowStale = showStaleEventsFromConfig();
+    const auto newEvents = eventsForCalendars(calendars, newSelected, m_startDate, m_endDate,
+                                               nullptr, newShowStale);
+    const QSet<QString> newUids = eventUids(newEvents);
+    QMultiHash<QDate, CalendarEvents::EventData> additions;
+    QList<CalendarEvents::EventData> existingEvents;
 
-    // A settings change is rare. Reconcile the displayed range by removing the
-    // old selected calendars' visible UIDs, then inserting the newly selected
-    // view. This avoids calling dataReady() with a full collection on top of
-    // Plasma's existing entries while retaining no per-event plugin cache.
-    if (m_selectionInitialized) {
-        const QSet<QString> previousSelected = m_hasExplicitSelection
-            ? m_selectedCalendarIds : calendarIds(calendars);
-        for (const QJsonValue &calendarValue : calendars) {
-            const QJsonObject calendar = calendarValue.toObject();
-            const QString calendarId = calendar.value(QStringLiteral("id")).toString();
-            if (!previousSelected.contains(calendarId)) {
-                continue;
-            }
-            for (const QJsonValue &eventValue : calendar.value(QStringLiteral("events")).toArray()) {
-                const QJsonObject source = eventValue.toObject();
-                CalendarEvents::EventData event;
-                if (toEventData(source, calendar.value(QStringLiteral("color")).toString(), &event)
-                    && eventOverlapsRange(event.startDateTime(), event.endDateTime(),
-                                          source.value(QStringLiteral("allDay")).toBool(false),
-                                          m_startDate, m_endDate)) {
-                    Q_EMIT eventRemoved(event.uid());
-                }
-            }
+    for (const QString &oldUid : std::as_const(m_publishedEventUids)) {
+        if (!newUids.contains(oldUid)) {
+            Q_EMIT eventRemoved(oldUid);
+        }
+    }
+    for (auto it = newEvents.cbegin(); it != newEvents.cend(); ++it) {
+        if (m_publishedEventUids.contains(it.value().uid())) {
+            existingEvents.append(it.value());
+        } else {
+            additions.insert(it.key(), it.value());
         }
     }
 
     m_selectedCalendarIds = newSelected;
+    m_staleCalendarIds = newStaleIds;
+    m_showStaleEvents = newShowStale;
     m_hasExplicitSelection = newHasExplicitSelection;
     m_selectionInitialized = true;
-    m_loadedRevision = snapshot.isEmpty() ? QString() : revisionForSnapshot(snapshot);
+    const QString newRevision = revisionForSnapshot(snapshot);
+    const bool snapshotChanged = !m_loadedRevision.isEmpty() && newRevision != m_loadedRevision;
+    m_loadedRevision = newRevision;
+    m_publishedEventUids = newUids;
     m_pendingRevision.clear();
     m_pendingPreviousRevision.clear();
     m_receivedDeltaBatches.clear();
     m_pendingBatchCount = 0;
+    m_cacheFingerprintTracker.markReconciled(cacheFingerprint());
 
-    Q_EMIT dataReady(eventsForCalendars(calendars, m_selectedCalendarIds, m_startDate, m_endDate));
+    qInfo() << "Thunderbird Calendar [Plasma]: applied calendar configuration; selected calendars"
+            << m_selectedCalendarIds.size() << "stale calendars" << m_staleCalendarIds.size()
+            << "show stale" << m_showStaleEvents << "visible events" << newUids.size();
+
+    if (!additions.isEmpty()) {
+        Q_EMIT dataReady(additions);
+        for (auto it = additions.cbegin(); it != additions.cend(); ++it) {
+            Q_EMIT eventModified(it.value());
+        }
+    }
+    if (snapshotChanged) {
+        for (const auto &event : std::as_const(existingEvents)) {
+            Q_EMIT eventModified(event);
+        }
+    }
+}
+
+void ThunderbirdCalendarEventsPlugin::reconcileFromSnapshot(const QString &reason)
+{
+    QString error;
+    const QJsonObject snapshot = readSnapshot(&error);
+    if (snapshot.isEmpty() || !snapshot.value(QStringLiteral("calendars")).isArray()) {
+        qWarning() << "Thunderbird Calendar [Plasma]: could not recover a missed event revision (" << reason << "): " << error;
+        m_cacheFingerprintTracker.markFailed(cacheFingerprint(), m_cacheRetryClock.elapsed());
+        return;
+    }
+
+    const QString newRevision = revisionForSnapshot(snapshot);
+    if (newRevision.isEmpty()) {
+        qWarning() << "Thunderbird Calendar [Plasma]: recovered snapshot has no content revision";
+        m_cacheFingerprintTracker.markFailed(cacheFingerprint(), m_cacheRetryClock.elapsed());
+        return;
+    }
+
+    const QJsonArray calendars = snapshot.value(QStringLiteral("calendars")).toArray();
+    bool hasExplicitSelection = false;
+    const QSet<QString> selected = selectionFromConfig(calendars, &hasExplicitSelection);
+    const QSet<QString> newStaleIds = staleCalendarIds(calendars);
+    const bool newShowStale = showStaleEventsFromConfig();
+    const bool viewConfigurationChanged = !m_selectionInitialized
+        || calendarViewConfigurationChanged(
+            m_selectedCalendarIds, m_hasExplicitSelection, m_staleCalendarIds, m_showStaleEvents,
+            selected, hasExplicitSelection, newStaleIds, newShowStale);
+    if (newRevision == m_loadedRevision && !viewConfigurationChanged) {
+        m_cacheFingerprintTracker.markReconciled(cacheFingerprint());
+        return;
+    }
+
+    // A cache read may have failed while applying a calendar-selection or
+    // stale-visibility change. The next polling retry can see the same content
+    // revision, but must still rebuild the view when configuration differs.
+    const auto currentEvents = eventsForCalendars(calendars, selected, m_startDate, m_endDate,
+                                                   nullptr, newShowStale);
+    const QSet<QString> currentUids = eventUids(currentEvents);
+    QMultiHash<QDate, CalendarEvents::EventData> additions;
+    QList<CalendarEvents::EventData> updates;
+
+    // We retain only the UID index for the previously published view. Event
+    // payloads are read from the authoritative snapshot/journal when recovery
+    // is needed, avoiding a second full event collection in the plugin.
+    for (const QString &oldUid : std::as_const(m_publishedEventUids)) {
+        if (!currentUids.contains(oldUid)) {
+            Q_EMIT eventRemoved(oldUid);
+        }
+    }
+    for (auto it = currentEvents.cbegin(); it != currentEvents.cend(); ++it) {
+        if (m_publishedEventUids.contains(it.value().uid())) {
+            updates.append(it.value());
+        } else {
+            additions.insert(it.key(), it.value());
+        }
+    }
+
+    m_selectedCalendarIds = selected;
+    m_staleCalendarIds = newStaleIds;
+    m_showStaleEvents = newShowStale;
+    m_hasExplicitSelection = hasExplicitSelection;
+    m_selectionInitialized = true;
+    m_publishedEventUids = currentUids;
+    m_loadedRevision = newRevision;
+    m_pendingRevision.clear();
+    m_pendingPreviousRevision.clear();
+    m_receivedDeltaBatches.clear();
+    m_pendingBatchCount = 0;
+    m_cacheFingerprintTracker.markReconciled(cacheFingerprint());
+
+    if (!additions.isEmpty()) {
+        Q_EMIT dataReady(additions);
+        // dataReady inserts the item; eventModified then invalidates the
+        // agenda cache for the event's actual date in Plasma's DaysModel.
+        for (auto it = additions.cbegin(); it != additions.cend(); ++it) {
+            Q_EMIT eventModified(it.value());
+        }
+    }
+    for (const auto &event : std::as_const(updates)) {
+        Q_EMIT eventModified(event);
+    }
+    qInfo() << "Thunderbird Calendar [Plasma]: reconciled missed updates from the recovery snapshot; reason"
+            << reason << "revision" << newRevision << "calendars" << calendars.size()
+            << "stale calendars" << m_staleCalendarIds.size() << "show stale" << m_showStaleEvents
+            << "visible events" << currentUids.size();
 }
 
 void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
@@ -595,6 +803,9 @@ void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
         || batchIndex < 0 || batchCount < 1 || batchIndex >= batchCount) {
         return;
     }
+    qInfo() << "Thunderbird Calendar [Plasma]: received event-delta batch" << batchIndex + 1 << "of" << batchCount
+            << "deltas" << envelope.value(QStringLiteral("deltas")).toArray().size()
+            << "from" << previousRevision << "to" << revision;
     // A range load can race with a D-Bus delta: if it read the already-updated
     // snapshot, its content revision matches and this delta must be ignored.
     if (revision == m_loadedRevision) {
@@ -602,8 +813,9 @@ void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
     }
     if (m_pendingRevision.isEmpty()) {
         if (previousRevision != m_loadedRevision) {
-            qWarning() << "Thunderbird Calendar: ignoring out-of-sequence event delta; expected base"
+            qWarning() << "Thunderbird Calendar [Plasma]: received an out-of-sequence event delta; reconciling from the durable journal. Expected base"
                        << m_loadedRevision << "received" << previousRevision;
+            reconcileFromSnapshot(QStringLiteral("D-Bus revision gap"));
             return;
         }
         m_pendingPreviousRevision = previousRevision;
@@ -612,7 +824,8 @@ void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
         m_receivedDeltaBatches.clear();
     } else if (m_pendingPreviousRevision != previousRevision
                || m_pendingRevision != revision || m_pendingBatchCount != batchCount) {
-        qWarning() << "Thunderbird Calendar: ignoring overlapping event-delta batch";
+        qWarning() << "Thunderbird Calendar [Plasma]: overlapping event-delta batch; reconciling from the durable journal";
+        reconcileFromSnapshot(QStringLiteral("overlapping D-Bus delta batches"));
         return;
     }
     if (m_receivedDeltaBatches.contains(batchIndex)) {
@@ -646,13 +859,20 @@ void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
 
         if (operation == QStringLiteral("add")) {
             if (newVisible) {
-                additions.insert(startDay, event);
+                if (m_publishedEventUids.contains(event.uid())) {
+                    // Treat a repeated add as an upsert. This makes a replayed
+                    // or duplicated D-Bus batch idempotent in Plasma's model.
+                    Q_EMIT eventModified(event);
+                } else {
+                    m_publishedEventUids.insert(event.uid());
+                    additions.insert(startDay, event);
+                }
             }
             continue;
         }
 
         if (operation == QStringLiteral("remove")) {
-            if (selected && newVisible) {
+            if (selected && newVisible && m_publishedEventUids.remove(event.uid()) > 0) {
                 Q_EMIT eventRemoved(event.uid());
             }
             continue;
@@ -666,22 +886,41 @@ void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
         CalendarEvents::EventData previousEvent;
         const bool previousVisible = selected
             && makeVisibleEvent(previousSource, &previousEvent, nullptr);
+        const bool previousWasPublished = previousVisible
+            && m_publishedEventUids.contains(previousEvent.uid());
 
         if (previousVisible && newVisible) {
             if (previousEvent.uid() != event.uid()) {
-                // The Plasma-facing UID includes the start date. A move therefore
-                // becomes an identity replacement, not an in-place modification.
-                // This is safe even when DaysModel queues removals: the queued old
-                // UID cannot remove the new date's incarnation of the event.
-                Q_EMIT eventRemoved(previousEvent.uid());
-                additions.insert(startDay, event);
-            } else {
+                // A move changes the date-scoped Plasma UID. Remove the old
+                // incarnation, then add the new one under its destination date.
+                if (previousWasPublished) {
+                    m_publishedEventUids.remove(previousEvent.uid());
+                    Q_EMIT eventRemoved(previousEvent.uid());
+                }
+                if (m_publishedEventUids.contains(event.uid())) {
+                    Q_EMIT eventModified(event);
+                } else {
+                    m_publishedEventUids.insert(event.uid());
+                    additions.insert(startDay, event);
+                }
+            } else if (previousWasPublished) {
                 Q_EMIT eventModified(event);
+            } else {
+                m_publishedEventUids.insert(event.uid());
+                additions.insert(startDay, event);
             }
         } else if (previousVisible) {
-            Q_EMIT eventRemoved(previousEvent.uid());
+            if (previousWasPublished) {
+                m_publishedEventUids.remove(previousEvent.uid());
+                Q_EMIT eventRemoved(previousEvent.uid());
+            }
         } else if (newVisible) {
-            additions.insert(startDay, event);
+            if (m_publishedEventUids.contains(event.uid())) {
+                Q_EMIT eventModified(event);
+            } else {
+                m_publishedEventUids.insert(event.uid());
+                additions.insert(startDay, event);
+            }
         }
     }
 
@@ -706,6 +945,9 @@ void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
     m_receivedDeltaBatches.insert(batchIndex);
     if (m_receivedDeltaBatches.size() == m_pendingBatchCount) {
         m_loadedRevision = m_pendingRevision;
+        m_cacheFingerprintTracker.markReconciled(cacheFingerprint());
+        qInfo() << "Thunderbird Calendar [Plasma]: completed event-delta revision" << m_loadedRevision
+                << "published events" << m_publishedEventUids.size();
         m_pendingRevision.clear();
         m_pendingPreviousRevision.clear();
         m_receivedDeltaBatches.clear();

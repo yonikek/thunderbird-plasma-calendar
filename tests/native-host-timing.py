@@ -31,6 +31,9 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="tb-calendar-host-test-") as cache_home:
         env = os.environ.copy()
         env["XDG_CACHE_HOME"] = cache_home
+        runtime_dir = os.path.join(cache_home, "runtime")
+        os.mkdir(runtime_dir, 0o700)
+        env["XDG_RUNTIME_DIR"] = runtime_dir
         completed = subprocess.run(
             [host], input=frame, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=env, check=False, timeout=15,

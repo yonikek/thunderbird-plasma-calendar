@@ -46,6 +46,20 @@ int CalendarConfigModel::count() const
     return m_calendars.size();
 }
 
+bool CalendarConfigModel::showStaleEvents() const
+{
+    return m_showStaleEvents;
+}
+
+void CalendarConfigModel::setShowStaleEvents(bool show)
+{
+    if (m_showStaleEvents == show) {
+        return;
+    }
+    m_showStaleEvents = show;
+    Q_EMIT showStaleEventsChanged();
+}
+
 QVariant CalendarConfigModel::data(const QModelIndex &index, int role) const
 {
     if (!index.isValid() || index.row() < 0 || index.row() >= m_calendars.size()) {
@@ -95,6 +109,7 @@ void CalendarConfigModel::saveConfig()
     }
     KConfigGroup group = KSharedConfig::openConfig()->group(QStringLiteral("ThunderbirdCalendarPlugin"));
     group.writeEntry(QStringLiteral("calendars"), selected);
+    group.writeEntry(QStringLiteral("showStaleEvents"), m_showStaleEvents);
     group.sync();
     notifyConfigurationChanged();
 }
@@ -105,6 +120,9 @@ void CalendarConfigModel::reload()
     m_calendars.clear();
 
     const KConfigGroup group = KSharedConfig::openConfig()->group(QStringLiteral("ThunderbirdCalendarPlugin"));
+    const bool showStaleEvents = group.readEntry(QStringLiteral("showStaleEvents"), true);
+    const bool staleSettingChanged = m_showStaleEvents != showStaleEvents;
+    m_showStaleEvents = showStaleEvents;
     const bool explicitSelection = group.hasKey(QStringLiteral("calendars"));
     const QStringList selected = group.readEntry(QStringLiteral("calendars"), QStringList());
 
@@ -127,4 +145,7 @@ void CalendarConfigModel::reload()
     }
     endResetModel();
     Q_EMIT countChanged();
+    if (staleSettingChanged) {
+        Q_EMIT showStaleEventsChanged();
+    }
 }
