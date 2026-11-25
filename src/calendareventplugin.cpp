@@ -534,6 +534,7 @@ ThunderbirdCalendarEventsPlugin::ThunderbirdCalendarEventsPlugin(QObject *parent
                 QStringLiteral("ConfigurationChanged"), this, SLOT(onConfigurationChanged()));
 
     m_cacheRetryClock.start();
+    m_dateRangeRequestClock.start();
 
     // D-Bus signals are normally immediate, but a plugin can be starting,
     // reloading or briefly disconnected when a delta is emitted. Poll only
@@ -548,9 +549,41 @@ ThunderbirdCalendarEventsPlugin::ThunderbirdCalendarEventsPlugin(QObject *parent
 
 void ThunderbirdCalendarEventsPlugin::loadEventsForDateRange(const QDate &startDate, const QDate &endDate)
 {
+    const quint64 requestNumber = ++m_dateRangeRequestCount;
+    const qint64 nowElapsedMs = m_dateRangeRequestClock.elapsed();
+    const qint64 msSincePreviousRequest = m_hasPreviousDateRangeRequest
+        ? nowElapsedMs - m_lastDateRangeRequestElapsedMs
+        : -1;
+    const bool sameRangeAsPrevious = m_hasPreviousDateRangeRequest
+        && startDate == m_lastRequestedStartDate
+        && endDate == m_lastRequestedEndDate;
+
+    if (sameRangeAsPrevious) {
+        ++m_consecutiveRepeatedDateRangeRequests;
+    } else {
+        m_consecutiveRepeatedDateRangeRequests = 0;
+    }
+
+    qInfo() << "Thunderbird Calendar [Plasma]: date-range request"
+            << requestNumber
+            << "start" << startDate
+            << "end" << endDate
+            << "has previous request" << m_hasPreviousDateRangeRequest
+            << "previous start" << m_lastRequestedStartDate
+            << "previous end" << m_lastRequestedEndDate
+            << "same range as previous" << sameRangeAsPrevious
+            << "consecutive repeated-range requests" << m_consecutiveRepeatedDateRangeRequests
+            << "ms since previous request" << msSincePreviousRequest
+            << "previous loaded revision" << m_loadedRevision
+            << "previous published events" << m_publishedEventUids.size();
+
+    m_lastRequestedStartDate = startDate;
+    m_lastRequestedEndDate = endDate;
+    m_lastDateRangeRequestElapsedMs = nowElapsedMs;
+    m_hasPreviousDateRangeRequest = true;
     m_startDate = startDate;
     m_endDate = endDate;
-    publishCurrentRange();
+    publishCurrentRange(QStringLiteral("date-range request #%1").arg(requestNumber));
 }
 
 bool ThunderbirdCalendarEventsPlugin::isCalendarSelected(const QString &calendarId) const
@@ -674,7 +707,7 @@ void ThunderbirdCalendarEventsPlugin::onEventsChanged()
                 << m_loadedRevision;
         reconcileFromSnapshot(QStringLiteral("full-snapshot notification"));
     } else {
-        publishCurrentRange();
+        publishCurrentRange(QStringLiteral("initial publication after full-snapshot notification"));
     }
 }
 
@@ -697,23 +730,33 @@ void ThunderbirdCalendarEventsPlugin::onConfigurationChanged()
     }
 }
 
-void ThunderbirdCalendarEventsPlugin::publishCurrentRange()
+void ThunderbirdCalendarEventsPlugin::publishCurrentRange(const QString &source)
 {
+    constexpr double NanosecondsPerMillisecond = 1000000.0;
+    QElapsedTimer totalTimer;
+    totalTimer.start();
+    QElapsedTimer stageTimer;
+    stageTimer.start();
+
     QString error;
     const QJsonObject snapshot = readSnapshot(&error);
+    const qint64 snapshotReadNs = stageTimer.nsecsElapsed();
     if (snapshot.isEmpty() && !error.isEmpty()) {
-        qWarning() << "Thunderbird Calendar [Plasma]: initial calendar snapshot is unavailable:" << error;
+        qWarning() << "Thunderbird Calendar [Plasma]: date-range publication for" << source
+                   << "cannot read the calendar snapshot:" << error;
         // Keep the previous fingerprint. onCachePoll() must retry this failed
         // read even when the files do not change again.
         m_cacheFingerprintTracker.markFailed(cacheFingerprint(), m_cacheRetryClock.elapsed());
         return;
     }
+    stageTimer.start();
     const QJsonArray calendars = snapshot.value(QStringLiteral("calendars")).toArray();
     m_selectedCalendarIds = selectionFromConfig(calendars, &m_hasExplicitSelection);
     m_staleCalendarIds = staleCalendarIds(calendars);
     m_showStaleEvents = showStaleEventsFromConfig();
     m_selectionInitialized = true;
     m_loadedRevision = snapshot.isEmpty() ? QString() : revisionForSnapshot(snapshot);
+    const qint64 selectionAndRevisionNs = stageTimer.nsecsElapsed();
     m_pendingRevision.clear();
     m_pendingPreviousRevision.clear();
     m_receivedDeltaBatches.clear();
@@ -722,14 +765,36 @@ void ThunderbirdCalendarEventsPlugin::publishCurrentRange()
     m_pendingRevisionEventModifiedSignals = 0;
     m_pendingRevisionDataReadyEvents = 0;
 
+    stageTimer.start();
     const auto events = eventsForCalendars(calendars, m_selectedCalendarIds, m_startDate, m_endDate,
                                            nullptr, m_showStaleEvents);
+    const qint64 eventSelectionAndConversionNs = stageTimer.nsecsElapsed();
+
+    stageTimer.start();
     m_publishedEventUids = eventUids(events);
+    const qint64 publishedUidIndexNs = stageTimer.nsecsElapsed();
     m_cacheFingerprintTracker.markReconciled(cacheFingerprint());
+
+    qInfo() << "Thunderbird Calendar [Plasma]: date-range publication preparation for" << source
+            << "snapshot read ms" << (static_cast<double>(snapshotReadNs) / NanosecondsPerMillisecond)
+            << "selection and revision setup ms" << (static_cast<double>(selectionAndRevisionNs) / NanosecondsPerMillisecond)
+            << "event filtering and conversion ms" << (static_cast<double>(eventSelectionAndConversionNs) / NanosecondsPerMillisecond)
+            << "published UID indexing ms" << (static_cast<double>(publishedUidIndexNs) / NanosecondsPerMillisecond)
+            << "events" << events.size()
+            << "revision" << m_loadedRevision;
+
     SignalEmissionTimings signalTimings;
     emitDataReady(events, signalTimings);
-    logSignalEmissionTimings(QStringLiteral("initial date-range publication"), signalTimings);
-    qInfo() << "Thunderbird Calendar [Plasma]: published date range" << m_startDate << "through" << m_endDate
+    logSignalEmissionTimings(source, signalTimings);
+
+    qInfo() << "Thunderbird Calendar [Plasma]: date-range publication completion for" << source
+            << "dataReady delivery ms" << (static_cast<double>(signalTimings.dataReadyTotalNs) / NanosecondsPerMillisecond)
+            << "total ms" << (static_cast<double>(totalTimer.nsecsElapsed()) / NanosecondsPerMillisecond)
+            << "events" << events.size()
+            << "revision" << m_loadedRevision;
+
+    qInfo() << "Thunderbird Calendar [Plasma]: published date range for" << source
+            << m_startDate << "through" << m_endDate
             << "calendars" << calendars.size() << "stale calendars" << m_staleCalendarIds.size()
             << "show stale" << m_showStaleEvents << "events" << events.size()
             << "revision" << m_loadedRevision;

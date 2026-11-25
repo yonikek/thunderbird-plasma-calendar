@@ -52,7 +52,7 @@ private:
         quint64 dataReadyMaxCallIndex = 0;
     };
 
-    void publishCurrentRange();
+    void publishCurrentRange(const QString &source);
     void applyCalendarSelectionChanges();
     void reconcileFromSnapshot(const QString &reason);
     bool isCalendarSelected(const QString &calendarId) const;
@@ -68,6 +68,13 @@ private:
 
     QDate m_startDate;
     QDate m_endDate;
+    QElapsedTimer m_dateRangeRequestClock;
+    QDate m_lastRequestedStartDate;
+    QDate m_lastRequestedEndDate;
+    qint64 m_lastDateRangeRequestElapsedMs = -1;
+    quint64 m_dateRangeRequestCount = 0;
+    quint64 m_consecutiveRepeatedDateRangeRequests = 0;
+    bool m_hasPreviousDateRangeRequest = false;
     QSet<QString> m_selectedCalendarIds;
     QSet<QString> m_staleCalendarIds;
     // Keep only the UIDs currently published to Plasma, not a second copy of
