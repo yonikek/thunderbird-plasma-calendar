@@ -617,6 +617,24 @@ void ThunderbirdCalendarEventsPlugin::emitEventRemoved(const QString &uid, const
     timer.start();
     Q_EMIT eventRemoved(uid);
     const qint64 elapsedNs = timer.nsecsElapsed();
+
+    // Emit one timing record per removal. Keep this after the emission so the
+    // measured interval contains only synchronous signal delivery, not the
+    // diagnostic logging itself. If a receiver never returns, the most recent
+    // pre-emission progress message above remains available in the journal.
+    const double elapsedMs = static_cast<double>(elapsedNs) / 1000000.0;
+    if (expectedCount > 0) {
+        qInfo() << "Thunderbird Calendar [Plasma]: eventRemoved individual delivery"
+                << operationCount << "of" << expectedCount
+                << "duration ms" << elapsedMs
+                << "source" << source;
+    } else {
+        qInfo() << "Thunderbird Calendar [Plasma]: eventRemoved individual delivery"
+                << operationCount
+                << "duration ms" << elapsedMs
+                << "source" << source;
+    }
+
     ++timings.eventRemovedCount;
     timings.eventRemovedTotalNs += elapsedNs;
     if (elapsedNs > timings.eventRemovedMaxNs) {
