@@ -4,7 +4,9 @@
 #include <CalendarEvents/CalendarEventsPlugin>
 #include "cachefingerprinttracker.h"
 
+#include <QDate>
 #include <QElapsedTimer>
+#include <QMultiHash>
 #include <QSet>
 #include <QString>
 #include <QTimer>
@@ -26,12 +28,43 @@ private Q_SLOTS:
     void onCachePoll();
 
 private:
+    // Measures time spent inside each synchronous Qt signal emission. This
+    // includes work performed by direct-connected receivers (not work queued
+    // for later delivery).
+    struct SignalEmissionTimings
+    {
+        quint64 eventRemovedCount = 0;
+        qint64 eventRemovedTotalNs = 0;
+        qint64 eventRemovedMaxNs = 0;
+        quint64 eventRemovedMaxIndex = 0;
+
+        quint64 eventModifiedCount = 0;
+        quint64 eventModifiedStartedCount = 0;
+        qint64 eventModifiedTotalNs = 0;
+        qint64 eventModifiedMaxNs = 0;
+        quint64 eventModifiedMaxIndex = 0;
+
+        quint64 dataReadyCalls = 0;
+        quint64 dataReadyStartedCalls = 0;
+        quint64 dataReadyEvents = 0;
+        qint64 dataReadyTotalNs = 0;
+        qint64 dataReadyMaxNs = 0;
+        quint64 dataReadyMaxCallIndex = 0;
+    };
+
     void publishCurrentRange();
     void applyCalendarSelectionChanges();
     void reconcileFromSnapshot(const QString &reason);
     bool isCalendarSelected(const QString &calendarId) const;
     void emitEventRemoved(const QString &uid, const QString &source,
-                          quint64 &operationCount, quint64 expectedCount = 0);
+                          quint64 &operationCount, SignalEmissionTimings &timings,
+                          quint64 expectedCount = 0);
+    void emitEventModified(const CalendarEvents::EventData &event,
+                           SignalEmissionTimings &timings);
+    void emitDataReady(const QMultiHash<QDate, CalendarEvents::EventData> &events,
+                       SignalEmissionTimings &timings);
+    void logSignalEmissionTimings(const QString &source,
+                                  const SignalEmissionTimings &timings) const;
 
     QDate m_startDate;
     QDate m_endDate;

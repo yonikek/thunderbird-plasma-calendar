@@ -560,7 +560,9 @@ bool ThunderbirdCalendarEventsPlugin::isCalendarSelected(const QString &calendar
 }
 
 void ThunderbirdCalendarEventsPlugin::emitEventRemoved(const QString &uid, const QString &source,
-                                                        quint64 &operationCount, quint64 expectedCount)
+                                                        quint64 &operationCount,
+                                                        SignalEmissionTimings &timings,
+                                                        quint64 expectedCount)
 {
     ++operationCount;
 
@@ -578,7 +580,88 @@ void ThunderbirdCalendarEventsPlugin::emitEventRemoved(const QString &uid, const
         }
     }
 
+    QElapsedTimer timer;
+    timer.start();
     Q_EMIT eventRemoved(uid);
+    const qint64 elapsedNs = timer.nsecsElapsed();
+    ++timings.eventRemovedCount;
+    timings.eventRemovedTotalNs += elapsedNs;
+    if (elapsedNs > timings.eventRemovedMaxNs) {
+        timings.eventRemovedMaxNs = elapsedNs;
+        timings.eventRemovedMaxIndex = operationCount;
+    }
+}
+
+void ThunderbirdCalendarEventsPlugin::emitEventModified(
+    const CalendarEvents::EventData &event, SignalEmissionTimings &timings)
+{
+    ++timings.eventModifiedStartedCount;
+    if (timings.eventModifiedStartedCount == 1 || timings.eventModifiedStartedCount % 50 == 0) {
+        qInfo() << "Thunderbird Calendar [Plasma]: emitting eventModified"
+                << timings.eventModifiedStartedCount;
+    }
+    QElapsedTimer timer;
+    timer.start();
+    Q_EMIT eventModified(event);
+    const qint64 elapsedNs = timer.nsecsElapsed();
+    ++timings.eventModifiedCount;
+    timings.eventModifiedTotalNs += elapsedNs;
+    if (elapsedNs > timings.eventModifiedMaxNs) {
+        timings.eventModifiedMaxNs = elapsedNs;
+        timings.eventModifiedMaxIndex = timings.eventModifiedCount;
+    }
+}
+
+void ThunderbirdCalendarEventsPlugin::emitDataReady(
+    const QMultiHash<QDate, CalendarEvents::EventData> &events,
+    SignalEmissionTimings &timings)
+{
+    ++timings.dataReadyStartedCalls;
+    qInfo() << "Thunderbird Calendar [Plasma]: emitting dataReady call"
+            << timings.dataReadyStartedCalls << "with" << events.size() << "events";
+    QElapsedTimer timer;
+    timer.start();
+    Q_EMIT dataReady(events);
+    const qint64 elapsedNs = timer.nsecsElapsed();
+    ++timings.dataReadyCalls;
+    timings.dataReadyEvents += static_cast<quint64>(events.size());
+    timings.dataReadyTotalNs += elapsedNs;
+    if (elapsedNs > timings.dataReadyMaxNs) {
+        timings.dataReadyMaxNs = elapsedNs;
+        timings.dataReadyMaxCallIndex = timings.dataReadyCalls;
+    }
+}
+
+void ThunderbirdCalendarEventsPlugin::logSignalEmissionTimings(
+    const QString &source, const SignalEmissionTimings &timings) const
+{
+    constexpr double NanosecondsPerMillisecond = 1000000.0;
+    qInfo() << "Thunderbird Calendar [Plasma]: signal delivery timings for" << source
+            << "eventRemoved count" << timings.eventRemovedCount
+            << "total ms" << (static_cast<double>(timings.eventRemovedTotalNs) / NanosecondsPerMillisecond)
+            << "average ms" << (timings.eventRemovedCount
+                                    ? static_cast<double>(timings.eventRemovedTotalNs)
+                                        / NanosecondsPerMillisecond / timings.eventRemovedCount
+                                    : 0.0)
+            << "max ms" << (static_cast<double>(timings.eventRemovedMaxNs) / NanosecondsPerMillisecond)
+            << "max at removal" << timings.eventRemovedMaxIndex
+            << "eventModified count" << timings.eventModifiedCount
+            << "total ms" << (static_cast<double>(timings.eventModifiedTotalNs) / NanosecondsPerMillisecond)
+            << "average ms" << (timings.eventModifiedCount
+                                    ? static_cast<double>(timings.eventModifiedTotalNs)
+                                        / NanosecondsPerMillisecond / timings.eventModifiedCount
+                                    : 0.0)
+            << "max ms" << (static_cast<double>(timings.eventModifiedMaxNs) / NanosecondsPerMillisecond)
+            << "max at modification" << timings.eventModifiedMaxIndex
+            << "dataReady calls" << timings.dataReadyCalls
+            << "events" << timings.dataReadyEvents
+            << "total ms" << (static_cast<double>(timings.dataReadyTotalNs) / NanosecondsPerMillisecond)
+            << "average ms" << (timings.dataReadyCalls
+                                    ? static_cast<double>(timings.dataReadyTotalNs)
+                                        / NanosecondsPerMillisecond / timings.dataReadyCalls
+                                    : 0.0)
+            << "max ms" << (static_cast<double>(timings.dataReadyMaxNs) / NanosecondsPerMillisecond)
+            << "max at dataReady call" << timings.dataReadyMaxCallIndex;
 }
 
 void ThunderbirdCalendarEventsPlugin::onEventsChanged()
@@ -643,7 +726,9 @@ void ThunderbirdCalendarEventsPlugin::publishCurrentRange()
                                            nullptr, m_showStaleEvents);
     m_publishedEventUids = eventUids(events);
     m_cacheFingerprintTracker.markReconciled(cacheFingerprint());
-    Q_EMIT dataReady(events);
+    SignalEmissionTimings signalTimings;
+    emitDataReady(events, signalTimings);
+    logSignalEmissionTimings(QStringLiteral("initial date-range publication"), signalTimings);
     qInfo() << "Thunderbird Calendar [Plasma]: published date range" << m_startDate << "through" << m_endDate
             << "calendars" << calendars.size() << "stale calendars" << m_staleCalendarIds.size()
             << "show stale" << m_showStaleEvents << "events" << events.size()
@@ -681,11 +766,12 @@ void ThunderbirdCalendarEventsPlugin::applyCalendarSelectionChanges()
         }
     }
     quint64 removalSignalCount = 0;
+    SignalEmissionTimings signalTimings;
 
     for (const QString &oldUid : std::as_const(m_publishedEventUids)) {
         if (!newUids.contains(oldUid)) {
             emitEventRemoved(oldUid, QStringLiteral("calendar configuration change"),
-                             removalSignalCount, expectedRemovalCount);
+                             removalSignalCount, signalTimings, expectedRemovalCount);
         }
     }
     for (auto it = newEvents.cbegin(); it != newEvents.cend(); ++it) {
@@ -719,20 +805,21 @@ void ThunderbirdCalendarEventsPlugin::applyCalendarSelectionChanges()
             << "show stale" << m_showStaleEvents << "visible events" << newUids.size();
 
     if (!additions.isEmpty()) {
-        Q_EMIT dataReady(additions);
+        emitDataReady(additions, signalTimings);
         for (auto it = additions.cbegin(); it != additions.cend(); ++it) {
-            Q_EMIT eventModified(it.value());
+            emitEventModified(it.value(), signalTimings);
         }
     }
     if (snapshotChanged) {
         for (const auto &event : std::as_const(existingEvents)) {
-            Q_EMIT eventModified(event);
+            emitEventModified(event, signalTimings);
         }
     }
+    logSignalEmissionTimings(QStringLiteral("calendar configuration change"), signalTimings);
     qInfo() << "Thunderbird Calendar [Plasma]: calendar-configuration signal counts:"
-            << "eventRemoved" << removalSignalCount
-            << "dataReady events" << additions.size()
-            << "eventModified" << (additions.size() + (snapshotChanged ? existingEvents.size() : 0));
+            << "eventRemoved" << signalTimings.eventRemovedCount
+            << "dataReady events" << signalTimings.dataReadyEvents
+            << "eventModified" << signalTimings.eventModifiedCount;
 }
 
 void ThunderbirdCalendarEventsPlugin::reconcileFromSnapshot(const QString &reason)
@@ -783,6 +870,7 @@ void ThunderbirdCalendarEventsPlugin::reconcileFromSnapshot(const QString &reaso
         }
     }
     quint64 removalSignalCount = 0;
+    SignalEmissionTimings signalTimings;
 
     // We retain only the UID index for the previously published view. Event
     // payloads are read from the authoritative snapshot/journal when recovery
@@ -790,7 +878,7 @@ void ThunderbirdCalendarEventsPlugin::reconcileFromSnapshot(const QString &reaso
     for (const QString &oldUid : std::as_const(m_publishedEventUids)) {
         if (!currentUids.contains(oldUid)) {
             emitEventRemoved(oldUid, QStringLiteral("snapshot reconciliation: ") + reason,
-                             removalSignalCount, expectedRemovalCount);
+                             removalSignalCount, signalTimings, expectedRemovalCount);
         }
     }
     for (auto it = currentEvents.cbegin(); it != currentEvents.cend(); ++it) {
@@ -818,24 +906,25 @@ void ThunderbirdCalendarEventsPlugin::reconcileFromSnapshot(const QString &reaso
     m_cacheFingerprintTracker.markReconciled(cacheFingerprint());
 
     if (!additions.isEmpty()) {
-        Q_EMIT dataReady(additions);
+        emitDataReady(additions, signalTimings);
         // dataReady inserts the item; eventModified then invalidates the
         // agenda cache for the event's actual date in Plasma's DaysModel.
         for (auto it = additions.cbegin(); it != additions.cend(); ++it) {
-            Q_EMIT eventModified(it.value());
+            emitEventModified(it.value(), signalTimings);
         }
     }
     for (const auto &event : std::as_const(updates)) {
-        Q_EMIT eventModified(event);
+        emitEventModified(event, signalTimings);
     }
+    logSignalEmissionTimings(QStringLiteral("snapshot reconciliation: ") + reason, signalTimings);
     qInfo() << "Thunderbird Calendar [Plasma]: reconciled missed updates from the recovery snapshot; reason"
             << reason << "revision" << newRevision << "calendars" << calendars.size()
             << "stale calendars" << m_staleCalendarIds.size() << "show stale" << m_showStaleEvents
             << "previous visible events" << previousPublishedEventCount
             << "visible events" << currentUids.size()
-            << "signal counts: eventRemoved" << removalSignalCount
-            << "dataReady events" << additions.size()
-            << "eventModified" << (additions.size() + updates.size());
+            << "signal counts: eventRemoved" << signalTimings.eventRemovedCount
+            << "dataReady events" << signalTimings.dataReadyEvents
+            << "eventModified" << signalTimings.eventModifiedCount;
 }
 
 void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
@@ -895,8 +984,8 @@ void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
 
     const QJsonArray deltas = envelope.value(QStringLiteral("deltas")).toArray();
     QMultiHash<QDate, CalendarEvents::EventData> additions;
-    quint64 batchEventRemovedSignals = 0;
-    quint64 batchEventModifiedSignals = 0;
+    quint64 batchRemovalProgress = 0;
+    SignalEmissionTimings signalTimings;
 
     auto makeVisibleEvent = [this](const QJsonObject &source, CalendarEvents::EventData *event,
                                    QDate *startDay) {
@@ -925,8 +1014,7 @@ void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
                 if (m_publishedEventUids.contains(event.uid())) {
                     // Treat a repeated add as an upsert. This makes a replayed
                     // or duplicated D-Bus batch idempotent in Plasma's model.
-                    ++batchEventModifiedSignals;
-                    Q_EMIT eventModified(event);
+                    emitEventModified(event, signalTimings);
                 } else {
                     m_publishedEventUids.insert(event.uid());
                     additions.insert(startDay, event);
@@ -940,7 +1028,7 @@ void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
                 emitEventRemoved(event.uid(),
                                  QStringLiteral("event-delta batch %1/%2")
                                      .arg(batchIndex + 1).arg(batchCount),
-                                 batchEventRemovedSignals);
+                                 batchRemovalProgress, signalTimings);
             }
             continue;
         }
@@ -965,18 +1053,16 @@ void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
                     emitEventRemoved(previousEvent.uid(),
                                      QStringLiteral("event-delta batch %1/%2")
                                          .arg(batchIndex + 1).arg(batchCount),
-                                     batchEventRemovedSignals);
+                                     batchRemovalProgress, signalTimings);
                 }
                 if (m_publishedEventUids.contains(event.uid())) {
-                    ++batchEventModifiedSignals;
-                    Q_EMIT eventModified(event);
+                    emitEventModified(event, signalTimings);
                 } else {
                     m_publishedEventUids.insert(event.uid());
                     additions.insert(startDay, event);
                 }
             } else if (previousWasPublished) {
-                ++batchEventModifiedSignals;
-                Q_EMIT eventModified(event);
+                emitEventModified(event, signalTimings);
             } else {
                 m_publishedEventUids.insert(event.uid());
                 additions.insert(startDay, event);
@@ -987,12 +1073,11 @@ void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
                 emitEventRemoved(previousEvent.uid(),
                                  QStringLiteral("event-delta batch %1/%2")
                                      .arg(batchIndex + 1).arg(batchCount),
-                                 batchEventRemovedSignals);
+                                 batchRemovalProgress, signalTimings);
             }
         } else if (newVisible) {
             if (m_publishedEventUids.contains(event.uid())) {
-                ++batchEventModifiedSignals;
-                Q_EMIT eventModified(event);
+                emitEventModified(event, signalTimings);
             } else {
                 m_publishedEventUids.insert(event.uid());
                 additions.insert(startDay, event);
@@ -1001,7 +1086,7 @@ void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
     }
 
     if (!additions.isEmpty()) {
-        Q_EMIT dataReady(additions);
+        emitDataReady(additions, signalTimings);
 
         // DaysModel::onDataReady() inserts the events, but only marks its
         // cached agenda data dirty when the additions include today's date.
@@ -1014,19 +1099,21 @@ void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
         // event's actual date. Our date-scoped UIDs also keep this safe when a
         // previous-date removal is queued by a newer Plasma implementation.
         for (auto it = additions.cbegin(); it != additions.cend(); ++it) {
-            ++batchEventModifiedSignals;
-            Q_EMIT eventModified(it.value());
+            emitEventModified(it.value(), signalTimings);
         }
     }
 
-    m_pendingRevisionEventRemovedSignals += batchEventRemovedSignals;
-    m_pendingRevisionEventModifiedSignals += batchEventModifiedSignals;
-    m_pendingRevisionDataReadyEvents += additions.size();
+    m_pendingRevisionEventRemovedSignals += signalTimings.eventRemovedCount;
+    m_pendingRevisionEventModifiedSignals += signalTimings.eventModifiedCount;
+    m_pendingRevisionDataReadyEvents += signalTimings.dataReadyEvents;
+    logSignalEmissionTimings(QStringLiteral("event-delta batch %1/%2")
+                                 .arg(batchIndex + 1).arg(batchCount),
+                             signalTimings);
     qInfo() << "Thunderbird Calendar [Plasma]: event-delta signal counts for batch"
             << batchIndex + 1 << "of" << batchCount
-            << "eventRemoved" << batchEventRemovedSignals
-            << "eventModified" << batchEventModifiedSignals
-            << "dataReady events" << additions.size()
+            << "eventRemoved" << signalTimings.eventRemovedCount
+            << "eventModified" << signalTimings.eventModifiedCount
+            << "dataReady events" << signalTimings.dataReadyEvents
             << "revision totals so far: eventRemoved" << m_pendingRevisionEventRemovedSignals
             << "eventModified" << m_pendingRevisionEventModifiedSignals
             << "dataReady events" << m_pendingRevisionDataReadyEvents;
