@@ -559,6 +559,28 @@ bool ThunderbirdCalendarEventsPlugin::isCalendarSelected(const QString &calendar
     return selected && (m_showStaleEvents || !m_staleCalendarIds.contains(calendarId));
 }
 
+void ThunderbirdCalendarEventsPlugin::emitEventRemoved(const QString &uid, const QString &source,
+                                                        quint64 &operationCount, quint64 expectedCount)
+{
+    ++operationCount;
+
+    // Log before emitting: the receiving Plasma slot may be the code that is
+    // slow or stuck. Progress messages therefore remain useful even if a
+    // large removal batch never reaches its completion summary.
+    if (operationCount == 1 || operationCount % 50 == 0
+        || (expectedCount > 0 && operationCount == expectedCount)) {
+        if (expectedCount > 0) {
+            qInfo() << "Thunderbird Calendar [Plasma]: emitting eventRemoved" << operationCount
+                    << "of" << expectedCount << "from" << source;
+        } else {
+            qInfo() << "Thunderbird Calendar [Plasma]: emitted eventRemoved progress" << operationCount
+                    << "from" << source;
+        }
+    }
+
+    Q_EMIT eventRemoved(uid);
+}
+
 void ThunderbirdCalendarEventsPlugin::onEventsChanged()
 {
     if (!m_startDate.isValid() || !m_endDate.isValid()) {
@@ -613,6 +635,9 @@ void ThunderbirdCalendarEventsPlugin::publishCurrentRange()
     m_pendingPreviousRevision.clear();
     m_receivedDeltaBatches.clear();
     m_pendingBatchCount = 0;
+    m_pendingRevisionEventRemovedSignals = 0;
+    m_pendingRevisionEventModifiedSignals = 0;
+    m_pendingRevisionDataReadyEvents = 0;
 
     const auto events = eventsForCalendars(calendars, m_selectedCalendarIds, m_startDate, m_endDate,
                                            nullptr, m_showStaleEvents);
@@ -649,9 +674,18 @@ void ThunderbirdCalendarEventsPlugin::applyCalendarSelectionChanges()
     QMultiHash<QDate, CalendarEvents::EventData> additions;
     QList<CalendarEvents::EventData> existingEvents;
 
+    quint64 expectedRemovalCount = 0;
     for (const QString &oldUid : std::as_const(m_publishedEventUids)) {
         if (!newUids.contains(oldUid)) {
-            Q_EMIT eventRemoved(oldUid);
+            ++expectedRemovalCount;
+        }
+    }
+    quint64 removalSignalCount = 0;
+
+    for (const QString &oldUid : std::as_const(m_publishedEventUids)) {
+        if (!newUids.contains(oldUid)) {
+            emitEventRemoved(oldUid, QStringLiteral("calendar configuration change"),
+                             removalSignalCount, expectedRemovalCount);
         }
     }
     for (auto it = newEvents.cbegin(); it != newEvents.cend(); ++it) {
@@ -675,6 +709,9 @@ void ThunderbirdCalendarEventsPlugin::applyCalendarSelectionChanges()
     m_pendingPreviousRevision.clear();
     m_receivedDeltaBatches.clear();
     m_pendingBatchCount = 0;
+    m_pendingRevisionEventRemovedSignals = 0;
+    m_pendingRevisionEventModifiedSignals = 0;
+    m_pendingRevisionDataReadyEvents = 0;
     m_cacheFingerprintTracker.markReconciled(cacheFingerprint());
 
     qInfo() << "Thunderbird Calendar [Plasma]: applied calendar configuration; selected calendars"
@@ -692,6 +729,10 @@ void ThunderbirdCalendarEventsPlugin::applyCalendarSelectionChanges()
             Q_EMIT eventModified(event);
         }
     }
+    qInfo() << "Thunderbird Calendar [Plasma]: calendar-configuration signal counts:"
+            << "eventRemoved" << removalSignalCount
+            << "dataReady events" << additions.size()
+            << "eventModified" << (additions.size() + (snapshotChanged ? existingEvents.size() : 0));
 }
 
 void ThunderbirdCalendarEventsPlugin::reconcileFromSnapshot(const QString &reason)
@@ -733,13 +774,23 @@ void ThunderbirdCalendarEventsPlugin::reconcileFromSnapshot(const QString &reaso
     const QSet<QString> currentUids = eventUids(currentEvents);
     QMultiHash<QDate, CalendarEvents::EventData> additions;
     QList<CalendarEvents::EventData> updates;
+    const qsizetype previousPublishedEventCount = m_publishedEventUids.size();
+
+    quint64 expectedRemovalCount = 0;
+    for (const QString &oldUid : std::as_const(m_publishedEventUids)) {
+        if (!currentUids.contains(oldUid)) {
+            ++expectedRemovalCount;
+        }
+    }
+    quint64 removalSignalCount = 0;
 
     // We retain only the UID index for the previously published view. Event
     // payloads are read from the authoritative snapshot/journal when recovery
     // is needed, avoiding a second full event collection in the plugin.
     for (const QString &oldUid : std::as_const(m_publishedEventUids)) {
         if (!currentUids.contains(oldUid)) {
-            Q_EMIT eventRemoved(oldUid);
+            emitEventRemoved(oldUid, QStringLiteral("snapshot reconciliation: ") + reason,
+                             removalSignalCount, expectedRemovalCount);
         }
     }
     for (auto it = currentEvents.cbegin(); it != currentEvents.cend(); ++it) {
@@ -761,6 +812,9 @@ void ThunderbirdCalendarEventsPlugin::reconcileFromSnapshot(const QString &reaso
     m_pendingPreviousRevision.clear();
     m_receivedDeltaBatches.clear();
     m_pendingBatchCount = 0;
+    m_pendingRevisionEventRemovedSignals = 0;
+    m_pendingRevisionEventModifiedSignals = 0;
+    m_pendingRevisionDataReadyEvents = 0;
     m_cacheFingerprintTracker.markReconciled(cacheFingerprint());
 
     if (!additions.isEmpty()) {
@@ -777,7 +831,11 @@ void ThunderbirdCalendarEventsPlugin::reconcileFromSnapshot(const QString &reaso
     qInfo() << "Thunderbird Calendar [Plasma]: reconciled missed updates from the recovery snapshot; reason"
             << reason << "revision" << newRevision << "calendars" << calendars.size()
             << "stale calendars" << m_staleCalendarIds.size() << "show stale" << m_showStaleEvents
-            << "visible events" << currentUids.size();
+            << "previous visible events" << previousPublishedEventCount
+            << "visible events" << currentUids.size()
+            << "signal counts: eventRemoved" << removalSignalCount
+            << "dataReady events" << additions.size()
+            << "eventModified" << (additions.size() + updates.size());
 }
 
 void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
@@ -822,6 +880,9 @@ void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
         m_pendingRevision = revision;
         m_pendingBatchCount = batchCount;
         m_receivedDeltaBatches.clear();
+        m_pendingRevisionEventRemovedSignals = 0;
+        m_pendingRevisionEventModifiedSignals = 0;
+        m_pendingRevisionDataReadyEvents = 0;
     } else if (m_pendingPreviousRevision != previousRevision
                || m_pendingRevision != revision || m_pendingBatchCount != batchCount) {
         qWarning() << "Thunderbird Calendar [Plasma]: overlapping event-delta batch; reconciling from the durable journal";
@@ -834,6 +895,8 @@ void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
 
     const QJsonArray deltas = envelope.value(QStringLiteral("deltas")).toArray();
     QMultiHash<QDate, CalendarEvents::EventData> additions;
+    quint64 batchEventRemovedSignals = 0;
+    quint64 batchEventModifiedSignals = 0;
 
     auto makeVisibleEvent = [this](const QJsonObject &source, CalendarEvents::EventData *event,
                                    QDate *startDay) {
@@ -862,6 +925,7 @@ void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
                 if (m_publishedEventUids.contains(event.uid())) {
                     // Treat a repeated add as an upsert. This makes a replayed
                     // or duplicated D-Bus batch idempotent in Plasma's model.
+                    ++batchEventModifiedSignals;
                     Q_EMIT eventModified(event);
                 } else {
                     m_publishedEventUids.insert(event.uid());
@@ -873,7 +937,10 @@ void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
 
         if (operation == QStringLiteral("remove")) {
             if (selected && newVisible && m_publishedEventUids.remove(event.uid()) > 0) {
-                Q_EMIT eventRemoved(event.uid());
+                emitEventRemoved(event.uid(),
+                                 QStringLiteral("event-delta batch %1/%2")
+                                     .arg(batchIndex + 1).arg(batchCount),
+                                 batchEventRemovedSignals);
             }
             continue;
         }
@@ -895,15 +962,20 @@ void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
                 // incarnation, then add the new one under its destination date.
                 if (previousWasPublished) {
                     m_publishedEventUids.remove(previousEvent.uid());
-                    Q_EMIT eventRemoved(previousEvent.uid());
+                    emitEventRemoved(previousEvent.uid(),
+                                     QStringLiteral("event-delta batch %1/%2")
+                                         .arg(batchIndex + 1).arg(batchCount),
+                                     batchEventRemovedSignals);
                 }
                 if (m_publishedEventUids.contains(event.uid())) {
+                    ++batchEventModifiedSignals;
                     Q_EMIT eventModified(event);
                 } else {
                     m_publishedEventUids.insert(event.uid());
                     additions.insert(startDay, event);
                 }
             } else if (previousWasPublished) {
+                ++batchEventModifiedSignals;
                 Q_EMIT eventModified(event);
             } else {
                 m_publishedEventUids.insert(event.uid());
@@ -912,10 +984,14 @@ void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
         } else if (previousVisible) {
             if (previousWasPublished) {
                 m_publishedEventUids.remove(previousEvent.uid());
-                Q_EMIT eventRemoved(previousEvent.uid());
+                emitEventRemoved(previousEvent.uid(),
+                                 QStringLiteral("event-delta batch %1/%2")
+                                     .arg(batchIndex + 1).arg(batchCount),
+                                 batchEventRemovedSignals);
             }
         } else if (newVisible) {
             if (m_publishedEventUids.contains(event.uid())) {
+                ++batchEventModifiedSignals;
                 Q_EMIT eventModified(event);
             } else {
                 m_publishedEventUids.insert(event.uid());
@@ -938,19 +1014,38 @@ void ThunderbirdCalendarEventsPlugin::onEventsDelta(const QString &json)
         // event's actual date. Our date-scoped UIDs also keep this safe when a
         // previous-date removal is queued by a newer Plasma implementation.
         for (auto it = additions.cbegin(); it != additions.cend(); ++it) {
+            ++batchEventModifiedSignals;
             Q_EMIT eventModified(it.value());
         }
     }
+
+    m_pendingRevisionEventRemovedSignals += batchEventRemovedSignals;
+    m_pendingRevisionEventModifiedSignals += batchEventModifiedSignals;
+    m_pendingRevisionDataReadyEvents += additions.size();
+    qInfo() << "Thunderbird Calendar [Plasma]: event-delta signal counts for batch"
+            << batchIndex + 1 << "of" << batchCount
+            << "eventRemoved" << batchEventRemovedSignals
+            << "eventModified" << batchEventModifiedSignals
+            << "dataReady events" << additions.size()
+            << "revision totals so far: eventRemoved" << m_pendingRevisionEventRemovedSignals
+            << "eventModified" << m_pendingRevisionEventModifiedSignals
+            << "dataReady events" << m_pendingRevisionDataReadyEvents;
 
     m_receivedDeltaBatches.insert(batchIndex);
     if (m_receivedDeltaBatches.size() == m_pendingBatchCount) {
         m_loadedRevision = m_pendingRevision;
         m_cacheFingerprintTracker.markReconciled(cacheFingerprint());
         qInfo() << "Thunderbird Calendar [Plasma]: completed event-delta revision" << m_loadedRevision
-                << "published events" << m_publishedEventUids.size();
+                << "published events" << m_publishedEventUids.size()
+                << "signal totals: eventRemoved" << m_pendingRevisionEventRemovedSignals
+                << "eventModified" << m_pendingRevisionEventModifiedSignals
+                << "dataReady events" << m_pendingRevisionDataReadyEvents;
         m_pendingRevision.clear();
         m_pendingPreviousRevision.clear();
         m_receivedDeltaBatches.clear();
         m_pendingBatchCount = 0;
+        m_pendingRevisionEventRemovedSignals = 0;
+        m_pendingRevisionEventModifiedSignals = 0;
+        m_pendingRevisionDataReadyEvents = 0;
     }
 }

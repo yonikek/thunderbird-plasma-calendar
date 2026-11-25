@@ -30,6 +30,8 @@ private:
     void applyCalendarSelectionChanges();
     void reconcileFromSnapshot(const QString &reason);
     bool isCalendarSelected(const QString &calendarId) const;
+    void emitEventRemoved(const QString &uid, const QString &source,
+                          quint64 &operationCount, quint64 expectedCount = 0);
 
     QDate m_startDate;
     QDate m_endDate;
@@ -50,4 +52,7 @@ private:
     QString m_pendingPreviousRevision;
     QSet<int> m_receivedDeltaBatches;
     int m_pendingBatchCount = 0;
+    quint64 m_pendingRevisionEventRemovedSignals = 0;
+    quint64 m_pendingRevisionEventModifiedSignals = 0;
+    quint64 m_pendingRevisionDataReadyEvents = 0;
 };

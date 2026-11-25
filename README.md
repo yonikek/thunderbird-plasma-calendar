@@ -338,7 +338,7 @@ journalctl --user -f -o short-precise \
   | tee "$HOME/thunderbird-plasma-calendar-plasma.log"
 ```
 
-Then restart Plasma Shell from another terminal or log out and back in. Reproduce the operation and stop the capture with Ctrl+C. The provider logs initialisation, published date ranges, event-delta batches, completed revisions, configuration changes and cache reconciliation. These diagnostics include revision IDs and counts, not event titles, descriptions or locations.
+Then restart Plasma Shell from another terminal or log out and back in. Reproduce the operation and stop the capture with Ctrl+C. The provider logs initialisation, published date ranges, event-delta batches, completed revisions, configuration changes and cache reconciliation. It also reports the exact number of `eventRemoved()` signals emitted by each snapshot/configuration operation and by each delta batch, with running totals across a complete delta revision. For large removal loops it logs progress before the first signal and every 50 signals, so the log can still show progress if a receiving Plasma slot stalls. These diagnostics include revision IDs and counts, not event titles, descriptions or locations.
 
 For a Plasma Shell crash, also capture the **unfiltered** user journal around the crash and inspect the core dump; the filtered command above intentionally excludes KDE, Qt and systemd crash messages:
 
